@@ -4,19 +4,17 @@
 """
 sampling_mlp_experiment.py
 - QM9 latent 공간에서 샘플링 전략 비교
-    * Random sampling
+    * Random sampling (uniform)
     * Latent k-center (farthest-first) sampling
+    * Latent density-weighted random sampling (low-density 영역 우선 탐색)
 - 각 N (configs.SAMPLING_NS)에 대해:
-    * 선택된 subset으로 ResidualMLP 학습
-    * 고정 test set에서 MAE / RMSE / R2 평가
+    * 선택된 subset으로 ResidualMLP 학습 (y: transform + scaling space)
+    * 고정 test set에서 MAE / RMSE / R2 평가 (raw HOMO space 기준)
 - 결과:
     * results_random.csv
     * results_kcenter.csv
-    * curve_mae.png (N vs MAE, random vs kcenter)
-
-업데이트:
-- MLP 학습 에포크 상한: 1000 (MAX_EPOCHS)
-- Early Stopping 추가 (EARLY_STOP_PATIENCE 연속 epoch 동안 val loss 개선 없으면 중단)
+    * results_density.csv
+    * curve_mae.png (N vs MAE, random vs kcenter vs density)
 """
 
 import os
@@ -30,16 +28,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+from sklearn.neighbors import NearestNeighbors  # density용
+
 import configs
 import utils
 from models import ResidualMLP
-
-
-# ------------------------------------------------------------
-# 학습 관련 전역 설정
-# ------------------------------------------------------------
-MAX_EPOCHS = 1000           # MLP 최대 에포크 수
-EARLY_STOP_PATIENCE = 50    # 연속 patience epoch 동안 val loss 개선 없으면 종료
 
 
 # ============================================================
@@ -86,6 +79,54 @@ def kcenter_greedy(
 
 
 # ============================================================
+# Latent density 기반 inverse-density weights
+#  - low-density 영역일수록 샘플링 확률↑
+# ============================================================
+def compute_inverse_density_weights(
+    Z: np.ndarray,
+    k: int = None,
+    alpha: float = None,
+) -> np.ndarray:
+    """
+    Z: (N, d) latent (보통 z_train_proc: 표준화된 latent)
+    k: k-NN 이웃 수 (None이면 configs.DENSITY_KNN_K 또는 10)
+    alpha: sparsity 강조 정도 (None이면 configs.DENSITY_ALPHA 또는 1.0)
+
+    return: probs (N,) - 합이 1인 확률 벡터
+    """
+    if k is None:
+        k = getattr(configs, "DENSITY_KNN_K", 10)
+    if alpha is None:
+        alpha = getattr(configs, "DENSITY_ALPHA", 1.0)
+
+    N = Z.shape[0]
+    assert N > k, "N must be > k for density estimation"
+
+    # k+1: 자기 자신 + k neighbors → 자기 자신 제외
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto")
+    nbrs.fit(Z)
+    dists, _ = nbrs.kneighbors(Z)  # (N, k+1)
+    dists = dists[:, 1:]           # (N, k)
+
+    # k-NN 평균 거리 → local sparsity proxy
+    mean_d = dists.mean(axis=1)  # (N,)
+
+    eps = 1e-8
+    density = 1.0 / (mean_d + eps)      # local density
+    inv_density = 1.0 / (density + eps) # low-density → 큰 값
+
+    # sparsity 강조
+    weights = inv_density ** alpha
+
+    # 극단 outlier 보호용 clip (옵션)
+    p99 = np.percentile(weights, 99.0)
+    weights = np.minimum(weights, p99)
+
+    probs = weights / weights.sum()
+    return probs
+
+
+# ============================================================
 # Numpy → Torch Dataset
 # ============================================================
 class NumpyDataset(Dataset):
@@ -108,8 +149,8 @@ class NumpyDataset(Dataset):
 
 # ============================================================
 # ResidualMLP 학습 루프
-#   - 여기서 y는 이미 (변환 + 스케일링된) space 상의 값
-#   - MAX_EPOCHS / EARLY_STOP_PATIENCE 적용
+#   - y는 이미 (변환 + 스케일링된) space 상의 값
+#   - early stopping 포함
 # ============================================================
 def train_mlp(
     z_train: np.ndarray,
@@ -122,6 +163,9 @@ def train_mlp(
     """
     선택된 subset으로 ResidualMLP를 한 번 학습하고, val에서 best 모델 반환.
     (y는 이미 transform + scaling된 값이라고 가정)
+    Early stopping:
+        - configs.MAX_EPOCHS 번까지 학습
+        - configs.EARLY_STOP_PATIENCE 동안 val 개선 없으면 중단
     """
     device = utils.get_device()
     utils.set_seed(configs.SEED)  # 내부 seed 재고정 (재현성)
@@ -150,11 +194,14 @@ def train_mlp(
         weight_decay=configs.MLP_WEIGHT_DECAY
     )
 
+    max_epochs = getattr(configs, "MAX_EPOCHS", configs.MLP_EPOCHS)
+    patience = getattr(configs, "EARLY_STOP_PATIENCE", 50)
+
     best_val_loss = float("inf")
     best_state_dict = None
-    epochs_no_improve = 0
+    no_improve_epochs = 0
 
-    for epoch in tqdm(range(1, MAX_EPOCHS + 1), desc=desc, ncols=100):
+    for epoch in tqdm(range(1, max_epochs + 1), desc=desc, ncols=100):
         # -----------------------------
         # Train
         # -----------------------------
@@ -197,28 +244,27 @@ def train_mlp(
 
         val_loss = val_loss_sum / max(1, n_val_batches)
 
-        if epoch % 50 == 0 or epoch == 1 or epoch == MAX_EPOCHS:
+        if epoch == 1 or epoch % 50 == 0 or epoch == max_epochs:
             logger.info(
-                f"[{desc}] Epoch {epoch}/{MAX_EPOCHS} "
+                f"[{desc}] Epoch {epoch}/{max_epochs} "
                 f"TrainLoss={train_loss:.6f}  ValLoss={val_loss:.6f}"
             )
 
         # -----------------------------
-        # Best 모델 갱신 & Early Stopping 카운트
+        # Early stopping & best 모델 갱신
         # -----------------------------
-        if val_loss < best_val_loss - 1e-8:  # 약간의 margin
+        if val_loss < best_val_loss - 1e-6:
             best_val_loss = val_loss
             best_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-            epochs_no_improve = 0
+            no_improve_epochs = 0
         else:
-            epochs_no_improve += 1
-
-        if epochs_no_improve >= EARLY_STOP_PATIENCE:
-            logger.info(
-                f"[{desc}] Early stopping at epoch {epoch} "
-                f"(no val improvement for {EARLY_STOP_PATIENCE} epochs)."
-            )
-            break
+            no_improve_epochs += 1
+            if no_improve_epochs >= patience:
+                logger.info(
+                    f"[{desc}] Early stopping at epoch {epoch} "
+                    f"(no val improvement for {patience} epochs)."
+                )
+                break
 
     logger.info(f"[{desc}] Best ValLoss={best_val_loss:.6f}")
 
@@ -230,8 +276,8 @@ def train_mlp(
 
 # ============================================================
 # Evaluation
-#   - z_test는 (옵션) standardization된 latent
-#   - y_test_raw는 "원래 HOMO 값" (변환/스케일링 전)
+#   - z_test_proc: (옵션) standardization된 latent
+#   - y_test_raw: "원래 HOMO 값" (변환/스케일링 전)
 # ============================================================
 @torch.no_grad()
 def eval_mlp(
@@ -277,7 +323,7 @@ def eval_mlp(
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Sampling experiment on QM9 latents (Random vs k-center)"
+        description="Sampling experiment on QM9 latents (Random vs k-center vs density-weighted)"
     )
     parser.add_argument("--seed", type=int, default=configs.RANDOM_SEED)
     parser.add_argument(
@@ -298,14 +344,14 @@ def main():
     log_file = os.path.join(configs.RESULT_DIR, "sampling_mlp_experiment.log")
     logger = utils.get_logger("sampling_mlp", log_file=log_file)
 
-    logger.info("===== Sampling MLP Experiment (Random vs k-center) =====")
+    logger.info("===== Sampling MLP Experiment (Random vs k-center vs density) =====")
     logger.info(f"NPZ path: {args.npz_path}")
     logger.info(
         f"Y_TRANSFORM={configs.Y_TRANSFORM}, "
         f"Y_SCALING={configs.Y_SCALING}, "
         f"Z_STANDARDIZE={configs.Z_STANDARDIZE}, "
-        f"MAX_EPOCHS={MAX_EPOCHS}, "
-        f"EARLY_STOP_PATIENCE={EARLY_STOP_PATIENCE}"
+        f"MAX_EPOCHS={getattr(configs, 'MAX_EPOCHS', configs.MLP_EPOCHS)}, "
+        f"EARLY_STOP_PATIENCE={getattr(configs, 'EARLY_STOP_PATIENCE', 50)}"
     )
 
     # --------------------------------------------------------
@@ -325,13 +371,14 @@ def main():
 
     # Target 분포 요약 (raw HOMO)
     hist_path = None
-    if configs.Y_HIST_PLOT:
+    if getattr(configs, "Y_HIST_PLOT", False):
         hist_path = os.path.join(configs.RESULT_DIR, "homo_hist_raw.png")
     utils.describe_target(
-        y_all, logger,
+        y_all,
+        logger,
         name="HOMO",
         hist_out=hist_path,
-        bins=configs.Y_HIST_BINS
+        bins=getattr(configs, "Y_HIST_BINS", 50),
     )
 
     # --------------------------------------------------------
@@ -374,7 +421,7 @@ def main():
         mode=configs.Y_SCALING
     )
     y_val_scaled = utils.scale_y_apply(y_val_trans, y_scaler_params)
-    y_test_scaled = utils.scale_y_apply(y_test_trans, y_scaler_params)
+    y_test_scaled = utils.scale_y_apply(y_test_trans, y_scaler_params)  # (직접 쓰진 않지만 일관성 유지)
 
     logger.info(
         f"Target scaling mode={y_scaler_params.get('mode', 'none')} "
@@ -397,7 +444,22 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Random / k-center 에 대해 실험
+    # density-weighted sampling용 확률 벡터 한 번 계산
+    # --------------------------------------------------------
+    logger.info("Computing density-based sampling probabilities on latent space...")
+    density_probs = compute_inverse_density_weights(
+        z_train_proc,
+        k=getattr(configs, "DENSITY_KNN_K", 10),
+        alpha=getattr(configs, "DENSITY_ALPHA", 1.0),
+    )
+    logger.info(
+        f"Density probs: min={density_probs.min():.6e}, "
+        f"max={density_probs.max():.6e}, "
+        f"mean={density_probs.mean():.6e}"
+    )
+
+    # --------------------------------------------------------
+    # Random / k-center / density 에 대해 실험
     # --------------------------------------------------------
     results_random = {
         "N": [],
@@ -417,11 +479,20 @@ def main():
         "Y_SCALING": [],
         "Z_STANDARDIZE": [],
     }
+    results_density = {
+        "N": [],
+        "MAE": [],
+        "RMSE": [],
+        "R2": [],
+        "Y_TRANSFORM": [],
+        "Y_SCALING": [],
+        "Z_STANDARDIZE": [],
+    }
 
     rng = np.random.RandomState(args.seed + 123)
 
-    # ---------------- Random ----------------
-    logger.info("### Random sampling experiments ###")
+    # ---------------- Random (uniform) ----------------
+    logger.info("### Random (uniform) sampling experiments ###")
     for N in Ns:
         logger.info(f"[Random] N = {N}")
 
@@ -492,6 +563,47 @@ def main():
         results_kcenter["Y_SCALING"].append(configs.Y_SCALING)
         results_kcenter["Z_STANDARDIZE"].append(configs.Z_STANDARDIZE)
 
+    # ---------------- Density-weighted ----------------
+    logger.info("### Density-weighted sampling experiments ###")
+    for N in Ns:
+        logger.info(f"[Density] N = {N}")
+
+        dens_idx = rng.choice(
+            len(z_train_proc),
+            size=N,
+            replace=False,
+            p=density_probs
+        )
+        z_sub = z_train_proc[dens_idx]
+        y_sub = y_train_scaled[dens_idx]
+
+        model_d = train_mlp(
+            z_sub, y_sub,
+            z_val_proc, y_val_scaled,
+            logger,
+            desc=f"Density N={N}"
+        )
+
+        mae_d, rmse_d, r2_d = eval_mlp(
+            model_d,
+            z_test_proc,
+            y_test_raw,
+            y_scaler_params,
+            configs.Y_TRANSFORM
+        )
+        logger.info(
+            f"[Density] N={N}  "
+            f"MAE={mae_d:.5f}, RMSE={rmse_d:.5f}, R2={r2_d:.5f}"
+        )
+
+        results_density["N"].append(N)
+        results_density["MAE"].append(mae_d)
+        results_density["RMSE"].append(rmse_d)
+        results_density["R2"].append(r2_d)
+        results_density["Y_TRANSFORM"].append(configs.Y_TRANSFORM)
+        results_density["Y_SCALING"].append(configs.Y_SCALING)
+        results_density["Z_STANDARDIZE"].append(configs.Z_STANDARDIZE)
+
     # --------------------------------------------------------
     # 결과 저장 (CSV + MAE 곡선)
     # --------------------------------------------------------
@@ -499,21 +611,26 @@ def main():
 
     df_random = pd.DataFrame(results_random)
     df_kcenter = pd.DataFrame(results_kcenter)
+    df_density = pd.DataFrame(results_density)
 
     random_csv = os.path.join(configs.RESULT_DIR, "results_random.csv")
     kcenter_csv = os.path.join(configs.RESULT_DIR, "results_kcenter.csv")
+    density_csv = os.path.join(configs.RESULT_DIR, "results_density.csv")
 
     df_random.to_csv(random_csv, index=False)
     df_kcenter.to_csv(kcenter_csv, index=False)
+    df_density.to_csv(density_csv, index=False)
 
     logger.info(f"Saved random results to: {random_csv}")
     logger.info(f"Saved k-center results to: {kcenter_csv}")
+    logger.info(f"Saved density results to: {density_csv}")
 
     # MAE 곡선 플롯
     if not args.no_plot:
         mae_dict = {
             "random": results_random["MAE"],
             "k-center": results_kcenter["MAE"],
+            "density": results_density["MAE"],
         }
         mae_png = os.path.join(configs.RESULT_DIR, "curve_mae.png")
         utils.save_learning_curve(
@@ -522,7 +639,7 @@ def main():
             out_png=mae_png,
             xlabel="# train samples",
             ylabel="MAE (HOMO)",
-            title="Random vs k-center sampling (QM9 latents)",
+            title="Random vs k-center vs density sampling (QM9 latents)",
         )
         logger.info(f"Saved MAE curve to: {mae_png}")
 
