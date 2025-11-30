@@ -13,6 +13,10 @@ sampling_mlp_experiment.py
     * results_random.csv
     * results_kcenter.csv
     * curve_mae.png (N vs MAE, random vs kcenter)
+
+업데이트:
+- MLP 학습 에포크 상한: 1000 (MAX_EPOCHS)
+- Early Stopping 추가 (EARLY_STOP_PATIENCE 연속 epoch 동안 val loss 개선 없으면 중단)
 """
 
 import os
@@ -29,6 +33,13 @@ from torch.utils.data import Dataset, DataLoader
 import configs
 import utils
 from models import ResidualMLP
+
+
+# ------------------------------------------------------------
+# 학습 관련 전역 설정
+# ------------------------------------------------------------
+MAX_EPOCHS = 1000           # MLP 최대 에포크 수
+EARLY_STOP_PATIENCE = 50    # 연속 patience epoch 동안 val loss 개선 없으면 종료
 
 
 # ============================================================
@@ -98,6 +109,7 @@ class NumpyDataset(Dataset):
 # ============================================================
 # ResidualMLP 학습 루프
 #   - 여기서 y는 이미 (변환 + 스케일링된) space 상의 값
+#   - MAX_EPOCHS / EARLY_STOP_PATIENCE 적용
 # ============================================================
 def train_mlp(
     z_train: np.ndarray,
@@ -140,8 +152,9 @@ def train_mlp(
 
     best_val_loss = float("inf")
     best_state_dict = None
+    epochs_no_improve = 0
 
-    for epoch in tqdm(range(1, configs.MLP_EPOCHS + 1), desc=desc, ncols=100):
+    for epoch in tqdm(range(1, MAX_EPOCHS + 1), desc=desc, ncols=100):
         # -----------------------------
         # Train
         # -----------------------------
@@ -184,18 +197,28 @@ def train_mlp(
 
         val_loss = val_loss_sum / max(1, n_val_batches)
 
-        if epoch % 50 == 0 or epoch == 1 or epoch == configs.MLP_EPOCHS:
+        if epoch % 50 == 0 or epoch == 1 or epoch == MAX_EPOCHS:
             logger.info(
-                f"[{desc}] Epoch {epoch}/{configs.MLP_EPOCHS} "
+                f"[{desc}] Epoch {epoch}/{MAX_EPOCHS} "
                 f"TrainLoss={train_loss:.6f}  ValLoss={val_loss:.6f}"
             )
 
         # -----------------------------
-        # Best 모델 갱신
+        # Best 모델 갱신 & Early Stopping 카운트
         # -----------------------------
-        if val_loss < best_val_loss:
+        if val_loss < best_val_loss - 1e-8:  # 약간의 margin
             best_val_loss = val_loss
             best_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= EARLY_STOP_PATIENCE:
+            logger.info(
+                f"[{desc}] Early stopping at epoch {epoch} "
+                f"(no val improvement for {EARLY_STOP_PATIENCE} epochs)."
+            )
+            break
 
     logger.info(f"[{desc}] Best ValLoss={best_val_loss:.6f}")
 
@@ -280,7 +303,9 @@ def main():
     logger.info(
         f"Y_TRANSFORM={configs.Y_TRANSFORM}, "
         f"Y_SCALING={configs.Y_SCALING}, "
-        f"Z_STANDARDIZE={configs.Z_STANDARDIZE}"
+        f"Z_STANDARDIZE={configs.Z_STANDARDIZE}, "
+        f"MAX_EPOCHS={MAX_EPOCHS}, "
+        f"EARLY_STOP_PATIENCE={EARLY_STOP_PATIENCE}"
     )
 
     # --------------------------------------------------------
@@ -302,7 +327,12 @@ def main():
     hist_path = None
     if configs.Y_HIST_PLOT:
         hist_path = os.path.join(configs.RESULT_DIR, "homo_hist_raw.png")
-    utils.describe_target(y_all, logger, name="HOMO", hist_out=hist_path, bins=configs.Y_HIST_BINS)
+    utils.describe_target(
+        y_all, logger,
+        name="HOMO",
+        hist_out=hist_path,
+        bins=configs.Y_HIST_BINS
+    )
 
     # --------------------------------------------------------
     # Target 변환 (예: signed_log1p)
