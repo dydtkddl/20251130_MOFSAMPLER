@@ -346,4 +346,158 @@ def main():
     y_val_scaled = utils.scale_y_apply(y_val_trans, y_scaler_params)
     y_test_scaled = utils.scale_y_apply(y_test_trans, y_scaler_params)
 
-    logger.inf
+    logger.info(
+        f"Target scaling mode={y_scaler_params.get('mode', 'none')} "
+        f"(Y_TRANSFORM={configs.Y_TRANSFORM})"
+    )
+
+    # 사용할 N 리스트 (train size 보다 큰 값은 제거)
+    Ns = [n for n in configs.SAMPLING_NS if n <= len(z_train_proc)]
+    logger.info(f"Sampling Ns: {Ns}")
+
+    # --------------------------------------------------------
+    # k-center index 미리 계산 (가장 큰 N에 대해 한 번만)
+    # --------------------------------------------------------
+    max_N = max(Ns)
+    logger.info(f"Precomputing k-center indices for max N={max_N}...")
+    kcenter_indices_full = kcenter_greedy(
+        z_train_proc,
+        n_samples=max_N,
+        seed=args.seed + 1
+    )
+
+    # --------------------------------------------------------
+    # Random / k-center 에 대해 실험
+    # --------------------------------------------------------
+    results_random = {
+        "N": [],
+        "MAE": [],
+        "RMSE": [],
+        "R2": [],
+        "Y_TRANSFORM": [],
+        "Y_SCALING": [],
+        "Z_STANDARDIZE": [],
+    }
+    results_kcenter = {
+        "N": [],
+        "MAE": [],
+        "RMSE": [],
+        "R2": [],
+        "Y_TRANSFORM": [],
+        "Y_SCALING": [],
+        "Z_STANDARDIZE": [],
+    }
+
+    rng = np.random.RandomState(args.seed + 123)
+
+    # ---------------- Random ----------------
+    logger.info("### Random sampling experiments ###")
+    for N in Ns:
+        logger.info(f"[Random] N = {N}")
+
+        rand_idx = rng.choice(len(z_train_proc), size=N, replace=False)
+        z_sub = z_train_proc[rand_idx]
+        y_sub = y_train_scaled[rand_idx]
+
+        model_r = train_mlp(
+            z_sub, y_sub,
+            z_val_proc, y_val_scaled,
+            logger,
+            desc=f"Random N={N}"
+        )
+
+        mae_r, rmse_r, r2_r = eval_mlp(
+            model_r,
+            z_test_proc,
+            y_test_raw,
+            y_scaler_params,
+            configs.Y_TRANSFORM
+        )
+        logger.info(
+            f"[Random] N={N}  "
+            f"MAE={mae_r:.5f}, RMSE={rmse_r:.5f}, R2={r2_r:.5f}"
+        )
+
+        results_random["N"].append(N)
+        results_random["MAE"].append(mae_r)
+        results_random["RMSE"].append(rmse_r)
+        results_random["R2"].append(r2_r)
+        results_random["Y_TRANSFORM"].append(configs.Y_TRANSFORM)
+        results_random["Y_SCALING"].append(configs.Y_SCALING)
+        results_random["Z_STANDARDIZE"].append(configs.Z_STANDARDIZE)
+
+    # ---------------- k-center ----------------
+    logger.info("### k-center sampling experiments ###")
+    for N in Ns:
+        logger.info(f"[k-center] N = {N}")
+
+        kc_idx = kcenter_indices_full[:N]
+        z_sub = z_train_proc[kc_idx]
+        y_sub = y_train_scaled[kc_idx]
+
+        model_k = train_mlp(
+            z_sub, y_sub,
+            z_val_proc, y_val_scaled,
+            logger,
+            desc=f"k-center N={N}"
+        )
+
+        mae_k, rmse_k, r2_k = eval_mlp(
+            model_k,
+            z_test_proc,
+            y_test_raw,
+            y_scaler_params,
+            configs.Y_TRANSFORM
+        )
+        logger.info(
+            f"[k-center] N={N}  "
+            f"MAE={mae_k:.5f}, RMSE={rmse_k:.5f}, R2={r2_k:.5f}"
+        )
+
+        results_kcenter["N"].append(N)
+        results_kcenter["MAE"].append(mae_k)
+        results_kcenter["RMSE"].append(rmse_k)
+        results_kcenter["R2"].append(r2_k)
+        results_kcenter["Y_TRANSFORM"].append(configs.Y_TRANSFORM)
+        results_kcenter["Y_SCALING"].append(configs.Y_SCALING)
+        results_kcenter["Z_STANDARDIZE"].append(configs.Z_STANDARDIZE)
+
+    # --------------------------------------------------------
+    # 결과 저장 (CSV + MAE 곡선)
+    # --------------------------------------------------------
+    os.makedirs(configs.RESULT_DIR, exist_ok=True)
+
+    df_random = pd.DataFrame(results_random)
+    df_kcenter = pd.DataFrame(results_kcenter)
+
+    random_csv = os.path.join(configs.RESULT_DIR, "results_random.csv")
+    kcenter_csv = os.path.join(configs.RESULT_DIR, "results_kcenter.csv")
+
+    df_random.to_csv(random_csv, index=False)
+    df_kcenter.to_csv(kcenter_csv, index=False)
+
+    logger.info(f"Saved random results to: {random_csv}")
+    logger.info(f"Saved k-center results to: {kcenter_csv}")
+
+    # MAE 곡선 플롯
+    if not args.no_plot:
+        mae_dict = {
+            "random": results_random["MAE"],
+            "k-center": results_kcenter["MAE"],
+        }
+        mae_png = os.path.join(configs.RESULT_DIR, "curve_mae.png")
+        utils.save_learning_curve(
+            x_values=Ns,
+            y_dict=mae_dict,
+            out_png=mae_png,
+            xlabel="# train samples",
+            ylabel="MAE (HOMO)",
+            title="Random vs k-center sampling (QM9 latents)",
+        )
+        logger.info(f"Saved MAE curve to: {mae_png}")
+
+    logger.info("Sampling MLP experiment finished. ✅")
+
+
+if __name__ == "__main__":
+    main()
