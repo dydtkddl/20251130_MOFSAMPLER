@@ -34,7 +34,6 @@ from models import ResidualMLP
 # ============================================================
 # k-center greedy (farthest-first) 샘플링
 # ============================================================
-
 def kcenter_greedy(
     X: np.ndarray,
     n_samples: int,
@@ -78,7 +77,6 @@ def kcenter_greedy(
 # ============================================================
 # Numpy → Torch Dataset
 # ============================================================
-
 class NumpyDataset(Dataset):
     """단순 (X, y) numpy array용 Dataset."""
 
@@ -99,8 +97,8 @@ class NumpyDataset(Dataset):
 
 # ============================================================
 # ResidualMLP 학습 루프
+#   - 여기서 y는 이미 (변환 + 스케일링된) space 상의 값
 # ============================================================
-
 def train_mlp(
     z_train: np.ndarray,
     y_train: np.ndarray,
@@ -111,6 +109,7 @@ def train_mlp(
 ) -> ResidualMLP:
     """
     선택된 subset으로 ResidualMLP를 한 번 학습하고, val에서 best 모델 반환.
+    (y는 이미 transform + scaling된 값이라고 가정)
     """
     device = utils.get_device()
     utils.set_seed(configs.SEED)  # 내부 seed 재고정 (재현성)
@@ -208,28 +207,44 @@ def train_mlp(
 
 # ============================================================
 # Evaluation
+#   - z_test는 (옵션) standardization된 latent
+#   - y_test_raw는 "원래 HOMO 값" (변환/스케일링 전)
 # ============================================================
-
 @torch.no_grad()
 def eval_mlp(
     model: ResidualMLP,
-    z_test: np.ndarray,
-    y_test: np.ndarray,
+    z_test_proc: np.ndarray,
+    y_test_raw: np.ndarray,
+    y_scaler_params: dict,
+    y_transform_mode: str,
 ) -> tuple:
+    """
+    model: ResidualMLP (transform+scaling된 space에서 학습된 상태)
+    z_test_proc: (N_test, d) - (옵션) standardization 적용된 latent
+    y_test_raw: (N_test,) - 원래 HOMO 값
+    y_scaler_params: scale_y_fit 에서 얻은 params dict
+    y_transform_mode: configs.Y_TRANSFORM 값
+    """
     device = utils.get_device()
     model = model.to(device)
     model.eval()
 
-    X_test = torch.from_numpy(z_test.astype(np.float32)).to(device)
-    y_true = torch.from_numpy(y_test.astype(np.float32)).to(device)
+    X_test = torch.from_numpy(z_test_proc.astype(np.float32)).to(device)
+    y_true_raw = np.asarray(y_test_raw, dtype=np.float32)
 
-    preds = model(X_test)
-    preds_np = preds.cpu().numpy()
-    y_true_np = y_true.cpu().numpy()
+    preds_scaled = model(X_test).cpu().numpy()  # (N_test, 1) or (N_test,)
+    preds_scaled = preds_scaled.reshape(-1).astype(np.float32)
 
-    mae = utils.mae(y_true_np, preds_np)
-    rmse = utils.rmse(y_true_np, preds_np)
-    r2 = utils.r2_numpy(y_true_np, preds_np)
+    # 1) scaling 역변환 (scaled → transformed space)
+    y_pred_trans = utils.inverse_scale_y(preds_scaled, y_scaler_params)
+
+    # 2) transform 역변환 (transformed → raw HOMO space)
+    y_pred_raw = utils.inverse_transform_y(y_pred_trans, y_transform_mode)
+
+    # metric은 "raw HOMO" 기준으로 계산
+    mae = utils.mae(y_true_raw, y_pred_raw)
+    rmse = utils.rmse(y_true_raw, y_pred_raw)
+    r2 = utils.r2_numpy(y_true_raw, y_pred_raw)
 
     return mae, rmse, r2
 
@@ -237,7 +252,6 @@ def eval_mlp(
 # ============================================================
 # 메인
 # ============================================================
-
 def main():
     parser = argparse.ArgumentParser(
         description="Sampling experiment on QM9 latents (Random vs k-center)"
@@ -263,6 +277,11 @@ def main():
 
     logger.info("===== Sampling MLP Experiment (Random vs k-center) =====")
     logger.info(f"NPZ path: {args.npz_path}")
+    logger.info(
+        f"Y_TRANSFORM={configs.Y_TRANSFORM}, "
+        f"Y_SCALING={configs.Y_SCALING}, "
+        f"Z_STANDARDIZE={configs.Z_STANDARDIZE}"
+    )
 
     # --------------------------------------------------------
     # Latent npz 로드
@@ -279,139 +298,52 @@ def main():
         f"(train/val/test = {len(idx_train)}/{len(idx_val)}/{len(idx_test)})"
     )
 
-    # train/val/test 분할
+    # Target 분포 요약 (raw HOMO)
+    hist_path = None
+    if configs.Y_HIST_PLOT:
+        hist_path = os.path.join(configs.RESULT_DIR, "homo_hist_raw.png")
+    utils.describe_target(y_all, logger, name="HOMO", hist_out=hist_path, bins=configs.Y_HIST_BINS)
+
+    # --------------------------------------------------------
+    # Target 변환 (예: signed_log1p)
+    # --------------------------------------------------------
+    y_all_trans = utils.transform_y(y_all, configs.Y_TRANSFORM)
+
+    # --------------------------------------------------------
+    # train/val/test 분할 (변환된 y 기준)
+    # --------------------------------------------------------
     z_train = z_all[idx_train]
-    y_train = y_all[idx_train]
-
-    z_val = z_all[idx_val] if len(idx_val) > 0 else z_train
-    y_val = y_all[idx_val] if len(idx_val) > 0 else y_train
-
+    z_val = z_all[idx_val] if len(idx_val) > 0 else z_all[idx_train]
     z_test = z_all[idx_test]
-    y_test = y_all[idx_test]
 
-    # 사용할 N 리스트 (train size 보다 큰 값은 제거)
-    Ns = [n for n in configs.SAMPLING_NS if n <= len(z_train)]
-    logger.info(f"Sampling Ns: {Ns}")
+    y_train_trans = y_all_trans[idx_train]
+    y_val_trans = y_all_trans[idx_val] if len(idx_val) > 0 else y_all_trans[idx_train]
+    y_test_trans = y_all_trans[idx_test]
+
+    # raw HOMO 값 (metrics용)
+    y_test_raw = y_all[idx_test]
 
     # --------------------------------------------------------
-    # k-center index 미리 계산 (가장 큰 N에 대해 한 번만)
+    # Latent Z standardization (옵션)
     # --------------------------------------------------------
-    max_N = max(Ns)
-    logger.info(f"Precomputing k-center indices for max N={max_N}...")
-    kcenter_indices_full = kcenter_greedy(
-        z_train,
-        n_samples=max_N,
-        seed=args.seed + 1
+    if configs.Z_STANDARDIZE:
+        logger.info("Applying feature-wise standardization to latent Z (train-based).")
+        z_train_proc, z_scaler_params = utils.standardize_features_fit(z_train)
+        z_val_proc = utils.standardize_features_apply(z_val, z_scaler_params)
+        z_test_proc = utils.standardize_features_apply(z_test, z_scaler_params)
+    else:
+        z_train_proc = z_train
+        z_val_proc = z_val
+        z_test_proc = z_test
+
+    # --------------------------------------------------------
+    # Target 스케일링 (train 기반)
+    # --------------------------------------------------------
+    y_train_scaled, y_scaler_params = utils.scale_y_fit(
+        y_train_trans,
+        mode=configs.Y_SCALING
     )
+    y_val_scaled = utils.scale_y_apply(y_val_trans, y_scaler_params)
+    y_test_scaled = utils.scale_y_apply(y_test_trans, y_scaler_params)
 
-    # --------------------------------------------------------
-    # Random / k-center 에 대해 실험
-    # --------------------------------------------------------
-    results_random = {
-        "N": [],
-        "MAE": [],
-        "RMSE": [],
-        "R2": [],
-    }
-    results_kcenter = {
-        "N": [],
-        "MAE": [],
-        "RMSE": [],
-        "R2": [],
-    }
-
-    rng = np.random.RandomState(args.seed + 123)
-
-    # ---------------- Random ----------------
-    logger.info("### Random sampling experiments ###")
-    for N in Ns:
-        logger.info(f"[Random] N = {N}")
-
-        rand_idx = rng.choice(len(z_train), size=N, replace=False)
-        z_sub = z_train[rand_idx]
-        y_sub = y_train[rand_idx]
-
-        model_r = train_mlp(
-            z_sub, y_sub,
-            z_val, y_val,
-            logger,
-            desc=f"Random N={N}"
-        )
-
-        mae_r, rmse_r, r2_r = eval_mlp(model_r, z_test, y_test)
-        logger.info(
-            f"[Random] N={N}  "
-            f"MAE={mae_r:.5f}, RMSE={rmse_r:.5f}, R2={r2_r:.5f}"
-        )
-
-        results_random["N"].append(N)
-        results_random["MAE"].append(mae_r)
-        results_random["RMSE"].append(rmse_r)
-        results_random["R2"].append(r2_r)
-
-    # ---------------- k-center ----------------
-    logger.info("### k-center sampling experiments ###")
-    for N in Ns:
-        logger.info(f"[k-center] N = {N}")
-
-        kc_idx = kcenter_indices_full[:N]
-        z_sub = z_train[kc_idx]
-        y_sub = y_train[kc_idx]
-
-        model_k = train_mlp(
-            z_sub, y_sub,
-            z_val, y_val,
-            logger,
-            desc=f"k-center N={N}"
-        )
-
-        mae_k, rmse_k, r2_k = eval_mlp(model_k, z_test, y_test)
-        logger.info(
-            f"[k-center] N={N}  "
-            f"MAE={mae_k:.5f}, RMSE={rmse_k:.5f}, R2={r2_k:.5f}"
-        )
-
-        results_kcenter["N"].append(N)
-        results_kcenter["MAE"].append(mae_k)
-        results_kcenter["RMSE"].append(rmse_k)
-        results_kcenter["R2"].append(r2_k)
-
-    # --------------------------------------------------------
-    # 결과 저장 (CSV + MAE 곡선)
-    # --------------------------------------------------------
-    os.makedirs(configs.RESULT_DIR, exist_ok=True)
-
-    df_random = pd.DataFrame(results_random)
-    df_kcenter = pd.DataFrame(results_kcenter)
-
-    random_csv = os.path.join(configs.RESULT_DIR, "results_random.csv")
-    kcenter_csv = os.path.join(configs.RESULT_DIR, "results_kcenter.csv")
-
-    df_random.to_csv(random_csv, index=False)
-    df_kcenter.to_csv(kcenter_csv, index=False)
-
-    logger.info(f"Saved random results to: {random_csv}")
-    logger.info(f"Saved k-center results to: {kcenter_csv}")
-
-    # MAE 곡선 플롯
-    if not args.no_plot:
-        mae_dict = {
-            "random": results_random["MAE"],
-            "k-center": results_kcenter["MAE"],
-        }
-        mae_png = os.path.join(configs.RESULT_DIR, "curve_mae.png")
-        utils.save_learning_curve(
-            x_values=Ns,
-            y_dict=mae_dict,
-            out_png=mae_png,
-            xlabel="# train samples",
-            ylabel="MAE (HOMO)",
-            title="Random vs k-center sampling (QM9 latents)",
-        )
-        logger.info(f"Saved MAE curve to: {mae_png}")
-
-    logger.info("Sampling MLP experiment finished. ✅")
-
-
-if __name__ == "__main__":
-    main()
+    logger.inf

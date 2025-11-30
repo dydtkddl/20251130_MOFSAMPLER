@@ -95,6 +95,33 @@ TRAIN_VAL_TEST_SPLIT = (0.8, 0.1, 0.1)  # 전체 QM9 기준 비율
 SAMPLING_NS = [10, 20, 50, 100, 200, 500, 1000, 2000]
 
 # ==============================
+# Target(HOMO) 변환 / 스케일링 설정
+# ==============================
+# Y_TRANSFORM:
+#   - "none"          : 변환 없음 (기본, 이전 코드와 동일)
+#   - "signed_log1p"  : sign(y) * log(1 + |y|)
+Y_TRANSFORM = "none"
+Y_TRANSFORM = "signed_log1p"
+# Y_SCALING:
+#   - "none"      : 스케일링 없음 (기본, 이전 코드와 동일)
+#   - "standard"  : (y - mean) / std
+#   - "robust"    : (y - median) / IQR
+Y_SCALING = "none"
+Y_SCALING = "standard"
+
+# Target 분포 로그 기록 시 히스토그램도 PNG로 저장할지 여부
+Y_HIST_PLOT = False
+Y_HIST_BINS = 50
+
+# ==============================
+# Latent Z 스케일링 옵션
+# ==============================
+# Z_STANDARDIZE:
+#   - False : z 그대로 사용 (기본, 이전 코드와 동일)
+#   - True  : train 기준 feature-wise standardization
+Z_STANDARDIZE = False
+Z_STANDARDIZE = True
+# ==============================
 # DataLoader / Logging 옵션
 # ==============================
 NUM_WORKERS = 4          # DataLoader num_workers

@@ -9,6 +9,7 @@ utils.py
 - device 헬퍼
 - train/val/test split
 - 학습 곡선 플롯 (샘플 수 vs MAE)
+- target 변환/스케일링 유틸
 """
 
 import os
@@ -212,3 +213,228 @@ def save_learning_curve(
     plt.tight_layout()
     plt.savefig(out_png, dpi=300)
     plt.close()
+
+
+# ==============================
+# Target(HOMO 등) 분포 요약 + 히스토그램
+# ==============================
+def describe_target(
+    y: np.ndarray,
+    logger: logging.Logger,
+    name: str = "target",
+    hist_out: str = None,
+    bins: int = 50
+) -> None:
+    """
+    y 분포에 대한 기본 통계 + (옵션) 히스토그램 PNG 저장.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    mean = np.mean(y)
+    std = np.std(y)
+    y_min = np.min(y)
+    y_max = np.max(y)
+    p1, p50, p99 = np.percentile(y, [1, 50, 99])
+
+    logger.info(
+        f"{name} stats (raw): "
+        f"mean={mean:.4f}, std={std:.4f}, min={y_min:.4f}, max={y_max:.4f}, "
+        f"p1={p1:.4f}, p50={p50:.4f}, p99={p99:.4f}"
+    )
+
+    if hist_out is not None:
+        out_dir = os.path.dirname(hist_out)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        plt.figure(figsize=(6, 4))
+        plt.hist(y, bins=bins, alpha=0.75)
+        plt.xlabel(name)
+        plt.ylabel("Count")
+        plt.title(f"Histogram of {name}")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(hist_out, dpi=300)
+        plt.close()
+        logger.info(f"{name} histogram saved to: {hist_out}")
+
+
+# ==============================
+# Target 변환 (예: signed_log1p)
+# ==============================
+def transform_y(y: np.ndarray, mode: str = "none") -> np.ndarray:
+    """
+    y → y_trans (training space 변환)
+    mode:
+        - "none"         : 그대로
+        - "signed_log1p" : sign(y) * log(1 + |y|)
+    """
+    y = np.asarray(y, dtype=np.float32)
+
+    if mode is None or mode.lower() == "none":
+        return y.copy()
+
+    mode = mode.lower()
+    if mode == "signed_log1p":
+        return np.sign(y) * np.log1p(np.abs(y)).astype(np.float32)
+
+    # 알 수 없는 모드는 경고 후 그대로 반환
+    print(f"[WARN] transform_y: unknown mode '{mode}', using 'none'")
+    return y.copy()
+
+
+def inverse_transform_y(y_trans: np.ndarray, mode: str = "none") -> np.ndarray:
+    """
+    y_trans → y_raw (역변환)
+    mode:
+        - "none"         : 그대로
+        - "signed_log1p" : sign(y) * (exp(|y|) - 1)
+    """
+    y_trans = np.asarray(y_trans, dtype=np.float32)
+
+    if mode is None or mode.lower() == "none":
+        return y_trans.copy()
+
+    mode = mode.lower()
+    if mode == "signed_log1p":
+        return np.sign(y_trans) * (np.expm1(np.abs(y_trans))).astype(np.float32)
+
+    print(f"[WARN] inverse_transform_y: unknown mode '{mode}', using 'none'")
+    return y_trans.copy()
+
+
+# ==============================
+# Target 스케일링 (standard / robust)
+# ==============================
+def scale_y_fit(
+    y: np.ndarray,
+    mode: str = "none"
+) -> Tuple[np.ndarray, Dict]:
+    """
+    y (1D) 를 주면, mode에 따라 스케일링된 y와 파라미터 dict를 반환.
+    mode:
+        - "none"     : 그대로
+        - "standard" : (y - mean) / std
+        - "robust"   : (y - median) / IQR
+    """
+    y = np.asarray(y, dtype=np.float32)
+
+    if mode is None or mode.lower() == "none":
+        params = {"mode": "none"}
+        return y.copy(), params
+
+    mode = mode.lower()
+    if mode == "standard":
+        mean = float(np.mean(y))
+        std = float(np.std(y))
+        if std < 1e-8:
+            std = 1.0
+        y_scaled = (y - mean) / std
+        params = {"mode": "standard", "mean": mean, "std": std}
+        return y_scaled.astype(np.float32), params
+
+    if mode == "robust":
+        median = float(np.median(y))
+        q1, q3 = np.percentile(y, [25, 75])
+        iqr = float(q3 - q1)
+        if iqr < 1e-8:
+            iqr = 1.0
+        y_scaled = (y - median) / iqr
+        params = {"mode": "robust", "median": median, "iqr": iqr}
+        return y_scaled.astype(np.float32), params
+
+    print(f"[WARN] scale_y_fit: unknown mode '{mode}', using 'none'")
+    params = {"mode": "none"}
+    return y.copy(), params
+
+
+def scale_y_apply(
+    y: np.ndarray,
+    params: Dict
+) -> np.ndarray:
+    """
+    fit된 params를 사용하여 y에 동일 스케일링 적용.
+    """
+    y = np.asarray(y, dtype=np.float32)
+    mode = params.get("mode", "none").lower()
+
+    if mode == "none":
+        return y.copy()
+
+    if mode == "standard":
+        mean = params["mean"]
+        std = params["std"]
+        return ((y - mean) / std).astype(np.float32)
+
+    if mode == "robust":
+        median = params["median"]
+        iqr = params["iqr"]
+        return ((y - median) / iqr).astype(np.float32)
+
+    print(f"[WARN] scale_y_apply: unknown mode '{mode}', using 'none'")
+    return y.copy()
+
+
+def inverse_scale_y(
+    y_scaled: np.ndarray,
+    params: Dict
+) -> np.ndarray:
+    """
+    스케일링된 y_scaled를 params 기준으로 원래 스케일로 복원.
+    """
+    y_scaled = np.asarray(y_scaled, dtype=np.float32)
+    mode = params.get("mode", "none").lower()
+
+    if mode == "none":
+        return y_scaled.copy()
+
+    if mode == "standard":
+        mean = params["mean"]
+        std = params["std"]
+        return (y_scaled * std + mean).astype(np.float32)
+
+    if mode == "robust":
+        median = params["median"]
+        iqr = params["iqr"]
+        return (y_scaled * iqr + median).astype(np.float32)
+
+    print(f"[WARN] inverse_scale_y: unknown mode '{mode}', using 'none'")
+    return y_scaled.copy()
+
+
+# ==============================
+# Latent Z standardization (옵션)
+# ==============================
+def standardize_features_fit(
+    X: np.ndarray,
+    eps: float = 1e-8
+) -> Tuple[np.ndarray, Dict]:
+    """
+    X: (N, d) 에 대해 feature-wise standardization.
+    return: X_scaled, {"mean": mean(d,), "std": std(d,)}
+    """
+    X = np.asarray(X, dtype=np.float32)
+    mean = X.mean(axis=0)
+    std = X.std(axis=0)
+    std = np.where(std < eps, 1.0, std)
+    X_scaled = (X - mean) / std
+    params = {
+        "mean": mean.astype(np.float32),
+        "std": std.astype(np.float32),
+    }
+    return X_scaled.astype(np.float32), params
+
+
+def standardize_features_apply(
+    X: np.ndarray,
+    params: Dict,
+    eps: float = 1e-8
+) -> np.ndarray:
+    """
+    fit된 params를 사용하여 X에 동일한 standardization 적용.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    mean = params["mean"]
+    std = params["std"]
+    std = np.where(std < eps, 1.0, std)
+    X_scaled = (X - mean) / std
+    return X_scaled.astype(np.float32)
