@@ -228,8 +228,8 @@ def main():
             r_max=configs.DESC_R_MAX,
             device=torch.device("cpu"),
         )
-        # graph-level 속성으로 붙이기
-        data.struct_desc = desc
+        # graph-level 속성으로 붙이기 (PyG에서 (B, 128)으로 쌓이게 2D로 저장)
+        data.struct_desc = desc.unsqueeze(0)   # (1, DESC_DIM)
         data_list.append(data)
 
     logger.info("Finished structural descriptor precomputation.")
