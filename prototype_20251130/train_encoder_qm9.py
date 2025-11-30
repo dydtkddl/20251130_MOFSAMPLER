@@ -17,14 +17,12 @@ train_encoder_qm9.py
 
 import os
 import argparse
-from typing import Tuple
 
 import numpy as np
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Subset
 
 from torch_geometric.datasets import QM9
 from torch_geometric.loader import DataLoader as PyGDataLoader
@@ -70,11 +68,9 @@ def build_structural_descriptor(
         hist = torch.zeros(num_bins, device=device)
     else:
         # (N,3) → pairwise 거리 (N*(N-1)/2,)
-        # torch.pdist는 CPU에서 동작하므로 device 강제시 CPU로 보내도 됨.
         dists = torch.pdist(pos, p=2)
 
         # [0, r_max] 구간에서 histogram
-        # torch.histc는 [min, max] 포함, bins 개
         hist = torch.histc(
             dists,
             bins=num_bins,
@@ -217,29 +213,33 @@ def main():
     logger.info(f"Loading QM9 dataset from: {qm9_root}")
     dataset = QM9(root=qm9_root)
 
-    N_data = len(dataset)
-    logger.info(f"QM9 total molecules: {N_data}")
+    logger.info(f"QM9 total molecules (raw): {len(dataset)}")
 
     # ----------------------------------------------
-    # 구조 descriptor 사전 계산 + Data에 저장
+    # 구조 descriptor 사전 계산 + data_list로 래핑
     # ----------------------------------------------
     logger.info("Precomputing structural descriptors for all molecules...")
 
+    data_list = []
     for data in tqdm(dataset, desc="Build descriptors", ncols=100):
-        # pos: (N_i, 3)
         desc = build_structural_descriptor(
             data.pos,
             num_bins=configs.DESC_NUM_BINS,
             r_max=configs.DESC_R_MAX,
             device=torch.device("cpu"),
         )
-        # Data 객체에 바로 저장 (PyG가 graph-wise 속성으로 잘 collate 해줌)
+        # graph-level 속성으로 붙이기
         data.struct_desc = desc
+        data_list.append(data)
 
     logger.info("Finished structural descriptor precomputation.")
 
+    # descriptor까지 포함된 유효 데이터 개수 기준
+    N_data = len(data_list)
+    logger.info(f"Effective dataset size (with descriptors): {N_data}")
+
     # ----------------------------------------------
-    # Train / Val / Test split
+    # Train / Val / Test split (data_list 기준)
     # ----------------------------------------------
     idx_train, idx_val, idx_test = utils.train_val_test_split_indices(
         N_data,
@@ -251,30 +251,46 @@ def main():
         f"val: {len(idx_val)}, test: {len(idx_test)}"
     )
 
-    train_subset = Subset(dataset, idx_train)
-    val_subset = Subset(dataset, idx_val)
+    # 인덱스로 리스트 슬라이싱해서 서브셋 구성
+    train_subset = [data_list[i] for i in idx_train]
+    val_subset = [data_list[i] for i in idx_val]
+
+    # full_loader는 latent 추출용 (train/val/test 전체)
+    full_dataset = data_list
     full_loader = PyGDataLoader(
-        dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=configs.NUM_WORKERS, pin_memory=configs.PIN_MEMORY
+        full_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=configs.NUM_WORKERS,
+        pin_memory=configs.PIN_MEMORY
     )
 
     train_loader = PyGDataLoader(
-        train_subset, batch_size=args.batch_size, shuffle=True,
-        num_workers=configs.NUM_WORKERS, pin_memory=configs.PIN_MEMORY
+        train_subset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=configs.NUM_WORKERS,
+        pin_memory=configs.PIN_MEMORY
     )
 
     val_loader = None
     if len(idx_val) > 0:
         val_loader = PyGDataLoader(
-            val_subset, batch_size=args.batch_size, shuffle=False,
-            num_workers=configs.NUM_WORKERS, pin_memory=configs.PIN_MEMORY
+            val_subset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=configs.NUM_WORKERS,
+            pin_memory=configs.PIN_MEMORY
         )
 
     # ----------------------------------------------
     # 모델/옵티마 초기화
     # ----------------------------------------------
     encoder = EquivGNNEncoder(latent_dim=args.latent_dim).to(device)
-    decoder = EquivDecoder(latent_dim=args.latent_dim, desc_dim=configs.DESC_DIM).to(device)
+    decoder = EquivDecoder(
+        latent_dim=args.latent_dim,
+        desc_dim=configs.DESC_DIM
+    ).to(device)
 
     params = list(encoder.parameters()) + list(decoder.parameters())
     optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
@@ -337,7 +353,7 @@ def main():
     target_idx = configs.QM9_HOMO_TARGET_INDEX
 
     y_all_list = []
-    for data in dataset:
+    for data in data_list:
         # PyG QM9: data.y shape (1, 19) or (19,)
         y = data.y.view(-1)
         y_homo = y[target_idx].item()
