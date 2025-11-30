@@ -216,23 +216,56 @@ def main():
     logger.info(f"QM9 total molecules (raw): {len(dataset)}")
 
     # ----------------------------------------------
-    # 구조 descriptor 사전 계산 + data_list로 래핑
+    # 구조 descriptor 캐시 사용 (있으면 로드, 없으면 계산 후 저장)
     # ----------------------------------------------
-    logger.info("Precomputing structural descriptors for all molecules...")
+    cache_path = getattr(configs, "DESC_CACHE_PATH", None)
 
-    data_list = []
-    for data in tqdm(dataset, desc="Build descriptors", ncols=100):
-        desc = build_structural_descriptor(
-            data.pos,
-            num_bins=configs.DESC_NUM_BINS,
-            r_max=configs.DESC_R_MAX,
-            device=torch.device("cpu"),
-        )
-        # graph-level 속성으로 붙이기 (PyG에서 (B, 128)으로 쌓이게 2D로 저장)
-        data.struct_desc = desc.unsqueeze(0)   # (1, DESC_DIM)
-        data_list.append(data)
+    if cache_path is not None and os.path.exists(cache_path):
+        # ===== 1) 캐시 파일이 이미 있는 경우: 로드해서 붙이기 =====
+        logger.info(f"Found descriptor cache at: {cache_path}")
+        struct_desc_all = torch.load(cache_path, map_location="cpu")
+        # struct_desc_all: (N_data, DESC_DIM) 가정
 
-    logger.info("Finished structural descriptor precomputation.")
+        assert struct_desc_all.shape[0] == len(dataset), \
+            "Descriptor cache size does not match QM9 dataset size."
+
+        data_list = []
+        for i, data in enumerate(dataset):
+            desc = struct_desc_all[i]              # (DESC_DIM,)
+            data.struct_desc = desc.unsqueeze(0)   # (1, DESC_DIM)
+            data_list.append(data)
+
+        logger.info("Loaded structural descriptors from cache.")
+
+    else:
+        # ===== 2) 캐시가 없으면: 새로 계산하고 저장 =====
+        logger.info("Precomputing structural descriptors for all molecules...")
+
+        data_list = []
+        desc_list = []
+
+        for data in tqdm(dataset, desc="Build descriptors", ncols=100):
+            desc = build_structural_descriptor(
+                data.pos,
+                num_bins=configs.DESC_NUM_BINS,
+                r_max=configs.DESC_R_MAX,
+                device=torch.device("cpu"),
+            )
+            # graph-level 속성으로 붙이기 (PyG에서 (B, 128)으로 쌓이게 2D로 저장)
+            data.struct_desc = desc.unsqueeze(0)   # (1, DESC_DIM)
+            data_list.append(data)
+
+            # 캐시용 리스트에도 저장 (CPU 텐서)
+            desc_list.append(desc.cpu())
+
+        logger.info("Finished structural descriptor precomputation.")
+
+        # desc_list를 하나의 텐서로 쌓아서 캐시 파일로 저장
+        if cache_path is not None:
+            struct_desc_all = torch.stack(desc_list, dim=0)  # (N_data, DESC_DIM)
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            torch.save(struct_desc_all, cache_path)
+            logger.info(f"Saved structural descriptor cache to: {cache_path}")
 
     # descriptor까지 포함된 유효 데이터 개수 기준
     N_data = len(data_list)

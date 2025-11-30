@@ -18,6 +18,9 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
 os.makedirs(DATA_ROOT, exist_ok=True)
 
+# QM9 구조 descriptor 캐시 파일 경로
+DESC_CACHE_PATH = os.path.join(DATA_ROOT, "qm9_struct_desc.pt")
+
 # 체크포인트(encoder/decoder/MLP 등) 저장 경로
 MODEL_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 os.makedirs(MODEL_DIR, exist_ok=True)
