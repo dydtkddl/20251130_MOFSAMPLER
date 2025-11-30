@@ -10,20 +10,19 @@ models.py
 설계 포인트
 ----------
 - Encoder:
-    * e3nn + PyG radius_graph 사용
+    * e3nn + PyG 기반
     * node irreps: configs.ENC_HIDDEN_IRREPS
     * 메시지패싱 블록은 Gate 없이 TP + Linear + ReLU + residual 구조 (버전 의존성 최소화)
 - Decoder:
     * 단순 MLP로 invariant descriptor 재구성 (DESC_DIM과 호환)
 - ResidualMLP:
-    * latent_dim → hidden_dim → 3개 residual block → scalar 출력
+    * latent_dim → hidden_dim → residual block 여러 개 → scalar 출력
 """
 
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import radius_graph
 
 from e3nn import o3
 from e3nn.o3 import FullyConnectedTensorProduct, Linear
@@ -44,7 +43,6 @@ class ResidualBlock(nn.Module):
         self.act = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, dim)
         out = self.fc(x)
         out = self.act(out)
         return x + out
@@ -145,7 +143,70 @@ class EquivMPBlock(nn.Module):
 
 
 # ============================================================
-# 3. Equivariant GNN Encoder (QM9 구조 → latent z)
+# 3. radius_graph 대체 구현 (torch-cluster 의존 제거)
+# ============================================================
+
+def build_radius_graph(
+    pos: torch.Tensor,
+    batch: torch.Tensor,
+    radius: float,
+) -> torch.Tensor:
+    """
+    torch_cluster.radius_graph 대신 쓰는 간단한 구현.
+
+    - pos:   (N, 3) 좌표
+    - batch: (N,) 그래프 인덱스 (0 ~ B-1)
+    - radius: cutoff 거리
+
+    return:
+        edge_index: (2, E) long tensor
+    """
+    device = pos.device
+    batch = batch.to(device)
+    radiussq = radius * radius
+
+    edge_src_list = []
+    edge_dst_list = []
+
+    # 각 그래프별로 나눠서 O(n_i^2)로 처리 (QM9라 괜찮음)
+    unique_batches = torch.unique(batch)
+    for b in unique_batches:
+        mask = (batch == b)
+        idx = torch.nonzero(mask, as_tuple=False).view(-1)  # (n_b,)
+        n_b = idx.numel()
+        if n_b <= 1:
+            continue
+
+        coords = pos[idx]  # (n_b, 3)
+
+        # pairwise 거리 제곱 (cdist 사용)
+        dists = torch.cdist(coords, coords, p=2)  # (n_b, n_b)
+        dists_sq = dists * dists
+
+        # 자기 자신(i==j) 제외하고, radius 이하인 edge 선택
+        mask_edge = (dists_sq <= radiussq) & (dists_sq > 0.0)
+        src_rel, dst_rel = torch.nonzero(mask_edge, as_tuple=True)
+
+        if src_rel.numel() == 0:
+            continue
+
+        src_abs = idx[src_rel]
+        dst_abs = idx[dst_rel]
+
+        edge_src_list.append(src_abs)
+        edge_dst_list.append(dst_abs)
+
+    if len(edge_src_list) == 0:
+        return torch.empty(2, 0, dtype=torch.long, device=device)
+
+    edge_src = torch.cat(edge_src_list)
+    edge_dst = torch.cat(edge_dst_list)
+    edge_index = torch.stack([edge_src, edge_dst], dim=0)  # (2, E)
+    return edge_index
+
+
+# ============================================================
+# 4. Equivariant GNN Encoder (QM9 구조 → latent z)
 # ============================================================
 
 class EquivGNNEncoder(nn.Module):
@@ -184,7 +245,6 @@ class EquivGNNEncoder(nn.Module):
         # ----------------------------------------------------
         # 원자 타입 embedding (scalar 0e) -> node_irreps로 사상
         # ----------------------------------------------------
-        # (간단히 0e scalar만 사용 후 Linear로 node_irreps로 투사)
         scalars_dim = 32
         self.atom_emb = nn.Embedding(max_atomic_num, scalars_dim)
         self.scalar_irreps = o3.Irreps(f"{scalars_dim}x0e")
@@ -222,11 +282,10 @@ class EquivGNNEncoder(nn.Module):
         x_scalar = self.atom_emb(z)  # (N, scalars_dim)
 
         # scalar irreps 텐서로 보고 node irreps로 사상
-        # e3nn Linear는 내부적으로 irreps 차원에 맞게 처리
         x = self.scalar2node(x_scalar)  # (N, node_irreps.dim)
 
-        # 2) radius graph (한 번만 계산 후 모든 layer에서 공유)
-        edge_index = radius_graph(pos, r=self.radius, batch=batch)
+        # 2) radius graph 생성 (torch-cluster 없이)
+        edge_index = build_radius_graph(pos, batch, self.radius)
         src, dst = edge_index
 
         # 3) edge 방향 기반 spherical harmonics (한 번 계산)
@@ -253,7 +312,7 @@ class EquivGNNEncoder(nn.Module):
 
 
 # ============================================================
-# 4. Invariant Decoder (latent → 구조 descriptor 재구성)
+# 5. Invariant Decoder (latent → 구조 descriptor 재구성)
 # ============================================================
 
 class EquivDecoder(nn.Module):
