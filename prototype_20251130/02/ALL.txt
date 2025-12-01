@@ -1,0 +1,2846 @@
+핵심부터 정리하면:
+
+* **구조 기반 피쳐는 두 군데에 들어간다**
+
+  1. **Encoder 입력 (node/edge feature)** → latent 공간 자체를 더 “structural”하게.
+  2. **Self-supervised target descriptor (graph-level)** → encoder가 무엇을 복원하도록 배울지.
+
+* 지금 네 코드 기준으로 바꿔야 하는 파일은 **4개**:
+  `configs.py`, `models.py`, `train_encoder_qm9.py`, `utils.py`
+  `sampling_mlp_experiment.py`는 latent만 쓰니까 **직접 수정 필요 없음**.
+
+아래는 그걸 전부 반영한 “수정 계획 명세표”야.
+
+---
+
+## 1. 파일별 전체 변경 요약
+
+| 파일                           | 수정 필요 여부 | 주요 변경 포인트                                                                                                        | 우선순위           |
+| ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- | -------------- |
+| `configs.py`                 | ✅ 수정     | 구조 피쳐 관련 하이퍼파라미터 추가 (node/edge/global descriptor), `DESC_DIM` 계산 방식 변경                                           | 필수             |
+| `models.py`                  | ✅ 수정     | `EquivGNNEncoder`에 node 구조 피쳐 입력 추가, (옵션) edge RBF 추가, decoder 출력 차원 `DESC_DIM` 맞추기                              | 필수(노드), 선택(엣지) |
+| `train_encoder_qm9.py`       | ✅ 수정     | per-atom node 구조 피쳐 계산 및 `data`에 저장, graph-level descriptor 확장 (RDF + 각도/shape 등), encoder/decoder 호출부 시그니처 업데이트 | 필수             |
+| `utils.py`                   | ✅ 수정     | 새 descriptor 구성 보조 함수 (각도 히스토그램, inertia 등), CN/밀도 계산 유틸 추가                                                      | 필수             |
+| `sampling_mlp_experiment.py` | ❌ 그대로 사용 | latent와 HOMO만 사용. 구조 피쳐 설계와 무관. 필요하면 로그에 구조 설정 요약 정도만 추가                                                         | 선택             |
+
+---
+
+## 2. Config 단계: 구조 피쳐 설정 추가 (`configs.py`)
+
+### 2-1. Node feature 관련 config
+
+| 항목                       | 예시 값    | 설명                                                    | 우선순위 |
+| ------------------------ | ------- | ----------------------------------------------------- | ---- |
+| `NODE_USE_CN`            | `True`  | coordination number 사용 여부                             | 필수   |
+| `NODE_USE_LOCAL_DENSITY` | `True`  | local density(평균 거리 기반) 사용 여부                         | 필수   |
+| `NODE_USE_DIST_STATS`    | `True`  | min/mean/max neighbor distance                        | 필수   |
+| `NODE_STRUCT_DIM`        | `4`~`6` | 위 피쳐들을 합친 node scalar feature 차원                      | 필수   |
+| `NODE_RADIUS`            | `5.0`   | CN/neighbor 계산에 사용할 cutoff (encoder radius와 맞추는 걸 권장) | 필수   |
+
+> 역할: `EquivGNNEncoder`에 들어갈 **추가 scalar 채널 수**를 미리 정의해서,
+> `models.py`에서 `atom_emb_dim + NODE_STRUCT_DIM` 을 scalar irreps로 매핑할 수 있게 함.
+
+---
+
+### 2-2. Graph-level descriptor 관련 config
+
+지금은 `pairwise distance histogram + 제곱` 하나로 2 * `DESC_NUM_BINS` 고정인데,
+여기서 다음을 합치는 걸 목표로:
+
+* RDF (pairwise distance histogram)
+* ADF (bond angle distribution)
+* Global shape (inertia tensor eigenvalues, radius of gyration)
+
+| 항목                    | 예시 값   | 설명                          | 우선순위          |
+| --------------------- | ------ | --------------------------- | ------------- |
+| `DESC_USE_RDF`        | `True` | 거리 히스토그램 사용                 | 필수            |
+| `DESC_USE_ADF`        | `True` | 각도 히스토그램 사용                 | 필수(Phase 1~2) |
+| `DESC_USE_SHAPE`      | `True` | inertia/Rg 같은 shape feature | 권장            |
+| `DESC_NUM_BINS_R`     | `64`   | RDF bin 수                   | 필수            |
+| `DESC_NUM_BINS_ANGLE` | `32`   | 각도 bin 수 (0~π)              | 필수(ADF 쓸 때)   |
+
+그리고 **중요 포인트**:
+
+```python
+# 예시: DESC_DIM을 “합산”으로 정의
+DESC_NUM_BINS_R = 64
+DESC_NUM_BINS_ANGLE = 32
+DESC_USE_RDF = True
+DESC_USE_ADF = True
+DESC_USE_SHAPE = True  # shape 피쳐 4차원 정도 가정
+
+DESC_DIM_R = 2 * DESC_NUM_BINS_R if DESC_USE_RDF else 0  # hist + hist^2
+DESC_DIM_A = 2 * DESC_NUM_BINS_ANGLE if DESC_USE_ADF else 0
+DESC_DIM_SHAPE = 4 if DESC_USE_SHAPE else 0
+
+DESC_DIM = DESC_DIM_R + DESC_DIM_A + DESC_DIM_SHAPE
+```
+
+* 이렇게 하면 `build_structural_descriptor()`에서 **길이를 계산해서 assert**로 점검할 수 있음.
+
+---
+
+### 2-3. Edge feature 관련 config (Phase 2 이후)
+
+(당장은 계획에만 넣어두고, 구현은 두 번째 단계에서)
+
+| 항목             | 예시 값   | 설명                                |
+| -------------- | ------ | --------------------------------- |
+| `EDGE_USE_RBF` | `True` | edge distance RBF embedding 사용 여부 |
+| `EDGE_RBF_DIM` | `32`   | RBF radial basis 차원 수             |
+| `EDGE_R_MAX`   | `5.0`  | RBF 최대 거리 (encoder radius와 동일하게)  |
+
+---
+
+## 3. Encoder/Decoder 수정 계획 (`models.py`)
+
+### 3-1. EquivGNNEncoder: node 구조 피쳐 추가
+
+**현재**:
+
+```python
+self.atom_emb = nn.Embedding(max_atomic_num, scalars_dim)
+self.scalar_irreps = o3.Irreps(f"{scalars_dim}x0e")
+self.scalar2node = Linear(self.scalar_irreps, self.node_irreps)
+...
+def forward(self, z, pos, batch):
+    x_scalar = self.atom_emb(z)  # (N, scalars_dim)
+    x = self.scalar2node(x_scalar)
+    ...
+```
+
+**변경 계획**:
+
+1. `__init__` 시그니처 확장
+
+```python
+def __init__(..., node_scalar_dim: int = configs.NODE_STRUCT_DIM, ...):
+    self.atom_emb_dim = 32
+    self.node_scalar_dim = node_scalar_dim
+    scalars_dim = self.atom_emb_dim + self.node_scalar_dim
+    self.atom_emb = nn.Embedding(max_atomic_num, self.atom_emb_dim)
+    self.scalar_irreps = o3.Irreps(f"{scalars_dim}x0e")
+    self.scalar2node = Linear(self.scalar_irreps, self.node_irreps)
+```
+
+2. `forward` 에 **추가 인자** 도입:
+
+```python
+def forward(self, z, pos, batch, node_struct_feats=None):
+    atom_emb = self.atom_emb(z)  # (N, atom_emb_dim)
+    if node_struct_feats is not None:
+        x_scalar = torch.cat([atom_emb, node_struct_feats], dim=-1)
+    else:
+        # node_struct_feats 없으면 뒤쪽 0으로 패딩 (디버그용)
+        pad = atom_emb.new_zeros(atom_emb.size(0), self.node_scalar_dim)
+        x_scalar = torch.cat([atom_emb, pad], dim=-1)
+    x = self.scalar2node(x_scalar)
+    ...
+```
+
+3. `train_encoder_qm9.py`와 `extract_latents`에서 호출 시:
+
+```python
+z_graph = encoder(batch.z, batch.pos, batch.batch, batch.node_struct_feats)
+```
+
+> 이렇게 하면 **원자 번호 + 구조 기반 scalar node feature**가 같이 irreps로 올라감.
+
+---
+
+### 3-2. EquivMPBlock / edge feature (Phase 2)
+
+**계획만**:
+
+* `build_radius_graph`에서 edge index만 만들고,
+* Encoder `forward` 안에서 edge 거리 `r_ij`를 계산 → RBF 변환 → `edge_rbf` (E, EDGE_RBF_DIM)
+* `EquivMPBlock.forward` 시그니처를 `(..., sh, edge_rbf=None)`으로 확장
+* 메시지 계산 시
+
+```python
+m = self.tp(x[src], sh)   # (E, node_irreps.dim)
+if edge_rbf is not None:
+    e = self.edge_mlp(edge_rbf)   # (E, node_irreps.dim)
+    m = m + e
+```
+
+이건 **나중에 RBF/dihedral 등 엣지 수준까지 확장하고 싶을 때** 적용.
+
+---
+
+### 3-3. EquivDecoder: `DESC_DIM` 대응
+
+지금도 이미 `desc_dim=configs.DESC_DIM`이라서,
+우리가 `configs.DESC_DIM`을 새 규칙대로 계산하면 **Decoder 쪽은 생성자 인자만 잘 넘기면 끝**.
+
+단, `build_structural_descriptor()` 변경 후 첫 실행 때,
+logger로 `DESC_DIM` / 실제 descriptor 길이 로그 찍어서 무결성 확인 정도만 추가.
+
+---
+
+## 4. 구조 descriptor 확장 계획 (`train_encoder_qm9.py` + `utils.py`)
+
+### 4-1. Node-level 구조 피쳐 계산 (per-atom)
+
+**어디에?**
+
+* `train_encoder_qm9.py` 안에서 QM9 dataset loop 할 때:
+
+  * 지금은 `build_structural_descriptor`만 호출하고 있음.
+  * 여기에 per-atom 계산을 추가해서 `data.node_struct_feats`로 저장.
+
+**필요 유틸 (utils.py에 추가)**:
+
+| 함수                                        | 입력               | 출력                                                   | 설명                         |
+| ----------------------------------------- | ---------------- | ---------------------------------------------------- | -------------------------- |
+| `compute_cn_and_dist_stats(pos, radius)`  | pos: (N,3)       | `cn` (N,), `mean_d` (N,), `min_d` (N,), `max_d` (N,) | 각 원자에 대한 neighbor 기반 통계    |
+| `pack_node_struct_feats(cn, mean_d, ...)` | per-atom scalar들 | (N, NODE_STRUCT_DIM)                                 | config에 맞춰 normalize/stack |
+
+`train_encoder_qm9.py` 측 코드 계획:
+
+```python
+from utils import compute_cn_and_dist_stats, pack_node_struct_feats
+
+for data in tqdm(dataset, ...):
+    # 1) graph descriptor
+    desc = build_structural_descriptor(...)
+
+    # 2) node-level struct feats
+    cn, mean_d, min_d, max_d = compute_cn_and_dist_stats(
+        data.pos, radius=configs.NODE_RADIUS
+    )
+    node_feats = pack_node_struct_feats(
+        cn=cn, mean_d=mean_d, min_d=min_d, max_d=max_d
+    )  # (N, NODE_STRUCT_DIM)
+
+    data.struct_desc = desc.unsqueeze(0)
+    data.node_struct_feats = node_feats
+```
+
+이렇게 하면 **Encoder가 바로 node_struct_feats를 받아서 사용** 가능.
+
+---
+
+### 4-2. Graph-level descriptor 확장 (RDF + ADF + Shape)
+
+현재 `build_structural_descriptor`는:
+
+* pairwise distance histogram → 정규화 → 제곱 → concat → `(2 * num_bins,)`
+
+**변경 목표**:
+
+* RDF: 기존 그대로 유지 (거리 기반)
+* ADF: angle histogram
+* Shape: inertia eigenvalues + radius of gyration (소수 개)
+
+**구조**:
+
+```python
+def build_structural_descriptor(pos, ...):
+    # RDF 부분
+    rdf = compute_rdf_descriptor(pos, num_bins=configs.DESC_NUM_BINS_R, r_max=configs.DESC_R_MAX)
+
+    # ADF 부분
+    if configs.DESC_USE_ADF:
+        adf = compute_adf_descriptor(pos, num_bins=configs.DESC_NUM_BINS_ANGLE)
+    else:
+        adf = None
+
+    # Shape 부분
+    if configs.DESC_USE_SHAPE:
+        shape = compute_shape_descriptor(pos)
+    else:
+        shape = None
+
+    desc_parts = [rdf]
+    if adf is not None: desc_parts.append(adf)
+    if shape is not None: desc_parts.append(shape)
+
+    desc = torch.cat(desc_parts, dim=0)
+    assert desc.shape[0] == configs.DESC_DIM
+    return desc
+```
+
+**각 세부 함수 위치**: `utils.py` 또는 `train_encoder_qm9.py` 상단.
+
+| 함수                                             | 설명                                                                | 비고                        |
+| ---------------------------------------------- | ----------------------------------------------------------------- | ------------------------- |
+| `compute_rdf_descriptor(pos, num_bins, r_max)` | 지금 구현(히스토그램 + 제곱)을 그대로 별도 함수로 분리                                  | 기존 코드 재활용                 |
+| `compute_adf_descriptor(pos, num_bins)`        | 모든 center j에 대해 이웃 i,k를 골라 angle(i-j-k) 계산 → histogram + 제곱       | cutoff는 `NODE_RADIUS` 재사용 |
+| `compute_shape_descriptor(pos)`                | 좌표의 inertia tensor eigenvalues(3) + radius of gyration(1) → 4D 벡터 | 분자 전체 macro shape         |
+
+---
+
+## 5. Dataset + DataLoader 부분 수정 (`train_encoder_qm9.py`)
+
+### 5-1. 캐시 저장 항목 확장
+
+기존 캐시는 **graph-level descriptor만** 가지고 있었음.
+이제는 node feature까지 포함되므로, 아래 2가지 옵션:
+
+1. **간단 옵션 (그래프 descriptor만 캐시)**
+
+   * `struct_desc_all`만 캐시,
+   * node_struct_feats는 매 run마다 다시 계산 (QM9 작아서 가능).
+
+2. **풀 캐시 (graph + node)**
+
+   * `qm9_struct_desc.pt`를 dict로 바꾸거나,
+   * 두 개의 파일: `qm9_struct_desc.pt`, `qm9_node_feats.pt`
+
+명세 차원에서는 ①으로 시작하는 걸 권장.
+
+### 5-2. Data 객체에 필드 추가
+
+`data.struct_desc`는 지금처럼 `(1, DESC_DIM)`.
+`data.node_struct_feats`는 `(N, NODE_STRUCT_DIM)`.
+
+PyG DataLoader는 자동으로 batch 차원 추가:
+
+* `batch.struct_desc` → `(B, DESC_DIM)`
+* `batch.node_struct_feats` → `(N_total, NODE_STRUCT_DIM)`
+
+이에 맞춰 encoder 호출:
+
+```python
+z_graph = encoder(
+    batch.z,
+    batch.pos,
+    batch.batch,
+    node_struct_feats=batch.node_struct_feats
+)
+```
+
+`extract_latents`에서도 동일하게 수정.
+
+---
+
+## 6. Sampling 실험 스크립트 영향 (`sampling_mlp_experiment.py`)
+
+* 이 스크립트는 `latents_qm9.npz`에 이미 있는 `z_all`과 `y_all`만 사용.
+* Encoder/descriptor가 바뀌면 **latent 분포와 예측 성능이 바뀔 뿐, 코드 수정은 거의 없음**.
+
+선택적으로, 로그에 아래 한 줄 정도 추가해서 어떤 구조 설정으로 만든 latent인지 기록:
+
+```python
+logger.info(
+    f"Descriptor config: DESC_DIM={configs.DESC_DIM}, "
+    f"USE_RDF={configs.DESC_USE_RDF}, USE_ADF={configs.DESC_USE_ADF}, "
+    f"USE_SHAPE={configs.DESC_USE_SHAPE}, NODE_STRUCT_DIM={configs.NODE_STRUCT_DIM}"
+)
+```
+
+---
+
+## 7. 요약: 단계별 구현 순서
+
+1. **Config 정리 (`configs.py`)**
+
+   * NODE/GRAPH descriptor 관련 flag와 dim 계산 로직 추가.
+2. **utils.py 확장**
+
+   * CN/neighbor 통계, RDF/ADF/Shape descriptor 함수 추가.
+3. **train_encoder_qm9.py 수정**
+
+   * dataset loop에서 node_struct_feats + new descriptor 생성.
+   * Data 객체에 `node_struct_feats` 필드 추가.
+4. **models.py 수정**
+
+   * `EquivGNNEncoder`에 `node_scalar_dim`, `node_struct_feats` 지원.
+   * Decoder는 새로운 `DESC_DIM` 사용.
+5. **sampling_mlp_experiment.py**는 그대로 두고, 결과만 다시 찍어보기.
+
+이 플랜대로 가면:
+
+* Encoder 입력에서 **node-level geometry**가 들어가고,
+* Self-supervised target에서 **global RDF + ADF + shape**를 복원하게 되어,
+* latent space가 “진짜 구조 정보”를 훨씬 더 잘 반영하게 될 거야.
+
+다음 스텝으로, 원하면 → 위 명세대로 실제 코드 패치 버전 (`configs.py`, `utils.py`, `train_encoder_qm9.py`, `models.py`) 한 파일씩 차례로 만들어줄게.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+configs.py
+- 공통 하이퍼파라미터 및 경로 설정 (Single Source of Truth)
+- 다른 스크립트에서 import 해서 사용
+
+구조 기반 확장 사항:
+1) Node-level 구조 피쳐 설정 (NODE_* 관련)
+2) Graph-level descriptor 설정 (RDF + ADF + Shape)
+3) Latent density 기반 샘플링 설정 (DENSITY_*)
+"""
+
+import os
+
+# ==============================
+# 프로젝트/경로 설정
+# ==============================
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# 원본/전처리 데이터 루트 (QM9 등)
+DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
+os.makedirs(DATA_ROOT, exist_ok=True)
+
+# QM9 구조 descriptor 캐시 파일 경로
+DESC_CACHE_PATH = os.path.join(DATA_ROOT, "qm9_struct_desc.pt")
+
+# 체크포인트(encoder/decoder/MLP 등) 저장 경로
+MODEL_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# 결과(npz, csv, plots) 저장 경로
+RESULT_DIR = os.path.join(PROJECT_ROOT, "results")
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+# QM9 latent 전용 출력 디렉토리 (encoder 학습 + npz 저장)
+OUT_DIR = os.path.join(PROJECT_ROOT, "qm9_latent")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# latents_qm9.npz 공통 경로 (train_encoder / sampling 실험에서 같이 사용)
+LATENT_NPZ_PATH = os.path.join(OUT_DIR, "latents_qm9.npz")
+
+# ==============================
+# Seed / Random 관련
+# ==============================
+SEED = 42
+RANDOM_SEED = SEED  # alias
+
+# ==============================
+# Encoder (EquivGNN) 설정
+# ==============================
+LATENT_DIM = 128
+
+# EquivGNN 내부 node feature irreps (encoder에서 기본값으로 사용)
+ENC_HIDDEN_IRREPS = "32x0e + 16x1o"
+
+ENC_LR = 1e-3
+ENC_BATCH_SIZE = 64
+ENC_EPOCHS = 100
+ENC_WEIGHT_DECAY = 1e-5
+
+# ==============================
+# Decoder (invariant head) 설정
+# ==============================
+DEC_HIDDEN_DIM = 256
+DEC_LR = ENC_LR         # encoder와 동일하게 두어도 OK
+DEC_WEIGHT_DECAY = ENC_WEIGHT_DECAY
+
+# ==============================
+# Node-level 구조 피쳐 설정
+#  - EquivGNNEncoder 입력으로 들어가는 scalar node feature
+# ==============================
+# 어떤 per-atom 구조 피쳐를 쓸지 flag로 관리
+NODE_USE_CN = True              # coordination number
+NODE_USE_LOCAL_DENSITY = True   # 평균 거리 역수 기반 local density
+NODE_USE_DIST_STATS = True      # min/mean/max neighbor distance
+
+# CN/neighbor 계산에 사용할 cutoff (encoder radius와 맞추는 걸 권장)
+NODE_RADIUS = 5.0
+
+# NODE_STRUCT_DIM 자동 계산 (flag 조합에 따라 결정)
+_node_struct_dim = 0
+if NODE_USE_CN:
+    _node_struct_dim += 1               # cn
+if NODE_USE_LOCAL_DENSITY:
+    _node_struct_dim += 1               # local_density
+if NODE_USE_DIST_STATS:
+    _node_struct_dim += 3               # min_d, mean_d, max_d
+
+NODE_STRUCT_DIM = _node_struct_dim      # EquivGNNEncoder에서 사용할 scalar 채널 수
+
+# ==============================
+# Graph-level 구조 descriptor 설정
+#  - train_encoder_qm9.py 의 build_structural_descriptor 와 일관되게 사용
+#  - RDF + ADF + Shape 구성
+# ==============================
+# RDF (Radial Distribution Function; pairwise distance histogram)
+DESC_USE_RDF = True
+DESC_NUM_BINS_R = 64        # [0, DESC_R_MAX] 구간을 등분
+DESC_R_MAX = 5.0            # RDF 상한 거리 (QM9 분자 scale 기준)
+
+# ADF (Angular Distribution Function; bond angle histogram)
+DESC_USE_ADF = True
+DESC_NUM_BINS_ANGLE = 32    # [0, π] 구간
+
+# Global Shape descriptor (inertia eigenvalues + radius of gyration 등)
+DESC_USE_SHAPE = True
+DESC_SHAPE_DIM = 4          # 예: 3개 eigenvalues + 1개 Rg
+
+# 각 파트별 descriptor dimension 계산
+DESC_DIM_R = 2 * DESC_NUM_BINS_R if DESC_USE_RDF else 0          # hist + hist^2
+DESC_DIM_A = 2 * DESC_NUM_BINS_ANGLE if DESC_USE_ADF else 0      # hist + hist^2
+DESC_DIM_SHAPE = DESC_SHAPE_DIM if DESC_USE_SHAPE else 0
+
+# 최종 graph-level descriptor dimension
+DESC_DIM = DESC_DIM_R + DESC_DIM_A + DESC_DIM_SHAPE
+
+# ==============================
+# QM9 target 설정 (HOMO index)
+# ==============================
+# PyG QM9 dataset 기준: y[:, 2]가 HOMO (기본)
+QM9_HOMO_TARGET_INDEX = 2
+
+# ==============================
+# Residual MLP (HOMO 예측용) 설정
+# ==============================
+MLP_HIDDEN_DIM = 256
+MLP_LAYERS = 3
+MLP_LR = 1e-3
+MLP_BATCH_SIZE = 256
+MLP_EPOCHS = 200
+MLP_WEIGHT_DECAY = 0.0
+
+# ==============================
+# 데이터 Split & 샘플링 설정
+# ==============================
+TRAIN_VAL_TEST_SPLIT = (0.8, 0.1, 0.1)  # 전체 QM9 기준 비율
+
+# 샘플링 실험에서 사용할 train size 리스트
+SAMPLING_NS = [10, 20, 50, 100, 200, 500, 1000, 2000]
+
+# ==============================
+# Target(HOMO) 변환 / 스케일링 설정
+# ==============================
+# Y_TRANSFORM:
+#   - "none"          : 변환 없음
+#   - "signed_log1p"  : sign(y) * log(1 + |y|)
+Y_TRANSFORM = "signed_log1p"
+
+# Y_SCALING:
+#   - "none"      : 스케일링 없음
+#   - "standard"  : (y - mean) / std
+#   - "robust"    : (y - median) / IQR
+Y_SCALING = "standard"
+
+# Target 분포 로그 기록 시 히스토그램도 PNG로 저장할지 여부
+Y_HIST_PLOT = False
+Y_HIST_BINS = 50
+
+# ==============================
+# Latent Z 스케일링 옵션
+# ==============================
+# Z_STANDARDIZE:
+#   - False : z 그대로 사용
+#   - True  : train 기준 feature-wise standardization
+Z_STANDARDIZE = True
+
+# ==============================
+# Latent density 기반 샘플링 설정
+#  - sampling_mlp_experiment.py 에서 사용
+# ==============================
+DENSITY_KNN_K = 10      # k-NN 이웃 수
+DENSITY_ALPHA = 1.0     # sparsity 강조 정도 (inverse-density^alpha)
+
+# ==============================
+# DataLoader / Logging 옵션
+# ==============================
+NUM_WORKERS = 4          # DataLoader num_workers
+PIN_MEMORY = True        # GPU 사용 시 DataLoader 옵션
+
+# 기본 로그 레벨 ("DEBUG", "INFO", "WARNING" ...)
+LOG_LEVEL = "INFO"
+
+# ==============================
+# Edge feature 관련 (Phase 2에서 사용 예정)
+# ==============================
+EDGE_USE_RBF = True      # edge distance RBF embedding 사용할지 여부 (현재는 설계만)
+EDGE_RBF_DIM = 32
+EDGE_R_MAX = 5.0         # encoder radius와 동일하게 두는 것을 권장
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+models.py
+- Equivariant GNN Encoder (QM9 구조 → latent z)
+- Invariant Decoder (latent → 구조 descriptor)
+- Residual MLP (latent → HOMO 예측)
+
+설계 포인트
+----------
+- Encoder:
+    * e3nn + PyG 기반
+    * node irreps: configs.ENC_HIDDEN_IRREPS
+    * 메시지패싱 블록은 Gate 없이 TP + Linear + ReLU + residual 구조 (버전 의존성 최소화)
+    * atomic number embedding + node-level 구조 피쳐 (scalar) 를 함께 사용
+- Decoder:
+    * 단순 MLP로 invariant descriptor 재구성 (DESC_DIM과 호환)
+- ResidualMLP:
+    * latent_dim → hidden_dim → residual block 여러 개 → scalar 출력
+"""
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+
+from e3nn import o3
+from e3nn.o3 import FullyConnectedTensorProduct, Linear
+
+import configs
+
+
+# ============================================================
+# 1. Residual Block & Residual MLP (HOMO 예측용)
+# ============================================================
+
+class ResidualBlock(nn.Module):
+    """단일 Residual MLP 블록: Linear -> ReLU -> skip connection."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.fc = nn.Linear(dim, dim)
+        self.act = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.fc(x)
+        out = self.act(out)
+        return x + out
+
+
+class ResidualMLP(nn.Module):
+    """
+    구조 latent z를 입력으로 HOMO를 예측하는 Residual MLP.
+    - 입력: (batch, latent_dim)
+    - 출력: (batch,) HOMO 값
+    """
+
+    def __init__(
+        self,
+        in_dim: int = configs.LATENT_DIM,
+        hidden_dim: int = configs.MLP_HIDDEN_DIM,
+        num_layers: int = configs.MLP_LAYERS,
+    ):
+        super().__init__()
+
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+        self.blocks = nn.ModuleList(
+            [ResidualBlock(hidden_dim) for _ in range(num_layers)]
+        )
+        self.out_proj = nn.Linear(hidden_dim, 1)
+
+        # 초기화 (선택적으로 조금 더 안정화)
+        nn.init.xavier_uniform_(self.in_proj.weight)
+        nn.init.zeros_(self.in_proj.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z: (batch, latent_dim)
+        return: (batch,)
+        """
+        h = self.in_proj(z)
+        h = torch.relu(h)
+
+        for block in self.blocks:
+            h = block(h)
+
+        out = self.out_proj(h)  # (batch, 1)
+        return out.squeeze(-1)
+
+
+# ============================================================
+# 2. Equivariant Message Passing Block
+#   - E(3) equivariant TP + Linear + ReLU + Residual
+# ============================================================
+
+class EquivMPBlock(nn.Module):
+    """
+    단일 equivariant message passing 블록.
+    - node_irreps -> node_irreps (residual)
+    - edge_irreps: spherical harmonics(l<=1 등)
+    """
+
+    def __init__(
+        self,
+        node_irreps: o3.Irreps,
+        edge_irreps: o3.Irreps,
+    ):
+        super().__init__()
+        self.node_irreps = node_irreps
+        self.edge_irreps = edge_irreps
+
+        # 메시지 계산용 TensorProduct: h_i, Y_ij -> m_ij
+        self.tp = FullyConnectedTensorProduct(
+            node_irreps, edge_irreps, node_irreps
+        )
+
+        # 메시지 aggregation 이후 node-wise 업데이트용 선형 변환
+        self.lin = Linear(node_irreps, node_irreps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        sh: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        x: (N, node_irreps.dim)
+        edge_index: (2, E)
+        sh: (E, edge_irreps.dim)
+        """
+        src, dst = edge_index
+
+        # 메시지: m_ij = TP(x_i, Y_ij)
+        m = self.tp(x[src], sh)  # (E, node_irreps.dim)
+
+        # 수신 노드 dst에 sum aggregation
+        N = x.shape[0]
+        m_agg = x.new_zeros((N, self.node_irreps.dim))
+        m_agg.index_add_(0, dst, m)
+
+        # 선형 + ReLU
+        h = self.lin(m_agg)
+        h = torch.relu(h)
+
+        # Residual
+        return x + h
+
+
+# ============================================================
+# 3. radius_graph 대체 구현 (torch-cluster 의존 제거)
+# ============================================================
+
+def build_radius_graph(
+    pos: torch.Tensor,
+    batch: torch.Tensor,
+    radius: float,
+) -> torch.Tensor:
+    """
+    torch_cluster.radius_graph 대신 쓰는 간단한 구현.
+
+    - pos:   (N, 3) 좌표
+    - batch: (N,) 그래프 인덱스 (0 ~ B-1)
+    - radius: cutoff 거리
+
+    return:
+        edge_index: (2, E) long tensor
+    """
+    device = pos.device
+    batch = batch.to(device)
+    radiussq = radius * radius
+
+    edge_src_list = []
+    edge_dst_list = []
+
+    # 각 그래프별로 나눠서 O(n_i^2)로 처리 (QM9라 괜찮음)
+    unique_batches = torch.unique(batch)
+    for b in unique_batches:
+        mask = (batch == b)
+        idx = torch.nonzero(mask, as_tuple=False).view(-1)  # (n_b,)
+        n_b = idx.numel()
+        if n_b <= 1:
+            continue
+
+        coords = pos[idx]  # (n_b, 3)
+
+        # pairwise 거리
+        dists = torch.cdist(coords, coords, p=2)  # (n_b, n_b)
+        dists_sq = dists * dists
+
+        # 자기 자신(i==j) 제외하고, radius 이하인 edge 선택
+        mask_edge = (dists_sq <= radiussq) & (dists_sq > 0.0)
+        src_rel, dst_rel = torch.nonzero(mask_edge, as_tuple=True)
+
+        if src_rel.numel() == 0:
+            continue
+
+        src_abs = idx[src_rel]
+        dst_abs = idx[dst_rel]
+
+        edge_src_list.append(src_abs)
+        edge_dst_list.append(dst_abs)
+
+    if len(edge_src_list) == 0:
+        return torch.empty(2, 0, dtype=torch.long, device=device)
+
+    edge_src = torch.cat(edge_src_list)
+    edge_dst = torch.cat(edge_dst_list)
+    edge_index = torch.stack([edge_src, edge_dst], dim=0)  # (2, E)
+    return edge_index
+
+
+# ============================================================
+# 4. Equivariant GNN Encoder (QM9 구조 → latent z)
+# ============================================================
+
+class EquivGNNEncoder(nn.Module):
+    """
+    QM9 분자 구조용 E(3)-equivariant encoder.
+
+    입력:
+        z: (N,) long, atomic numbers
+        pos: (N, 3) float, 3D coordinates
+        batch: (N,) long, PyG graph index (0 ~ B-1)
+        node_struct_feats: (N, NODE_STRUCT_DIM) float, per-atom 구조 피쳐
+
+    출력:
+        z_graph: (B, latent_dim) graph-level latent
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = configs.LATENT_DIM,
+        radius: float = 5.0,
+        max_atomic_num: int = 100,
+        num_layers: int = 3,
+        node_irreps_str: str = configs.ENC_HIDDEN_IRREPS,
+        lmax_edge: int = 1,
+        node_scalar_dim: int = configs.NODE_STRUCT_DIM,
+    ):
+        super().__init__()
+        self.radius = radius
+        self.latent_dim = latent_dim
+        self.num_layers = num_layers
+
+        # ----------------------------------------------------
+        # irreps 설정
+        # ----------------------------------------------------
+        self.node_irreps = o3.Irreps(node_irreps_str)
+        self.edge_irreps = o3.Irreps.spherical_harmonics(lmax=lmax_edge)
+
+        # ----------------------------------------------------
+        # 원자 타입 embedding (scalar 0e) + node 구조 scalar 피쳐
+        #   총 scalar 채널 수 = atom_emb_dim + node_scalar_dim
+        #   → scalar_irreps 로 보고 node_irreps 로 사상
+        # ----------------------------------------------------
+        self.atom_emb_dim = 32
+        self.node_scalar_dim = node_scalar_dim
+        scalars_dim = self.atom_emb_dim + self.node_scalar_dim
+
+        self.atom_emb = nn.Embedding(max_atomic_num, self.atom_emb_dim)
+        self.scalar_irreps = o3.Irreps(f"{scalars_dim}x0e")
+        self.scalar2node = Linear(self.scalar_irreps, self.node_irreps)
+
+        # ----------------------------------------------------
+        # Equivariant MP blocks (multi-layer + residual)
+        # ----------------------------------------------------
+        self.layers = nn.ModuleList([
+            EquivMPBlock(self.node_irreps, self.edge_irreps)
+            for _ in range(num_layers)
+        ])
+
+        # ----------------------------------------------------
+        # graph-level pooling 후 latent로 MLP 투사
+        # ----------------------------------------------------
+        self.readout = nn.Sequential(
+            nn.Linear(self.node_irreps.dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim),
+        )
+
+        # 기본 초기화 (선택적)
+        nn.init.xavier_uniform_(self.readout[0].weight)
+        nn.init.zeros_(self.readout[0].bias)
+        nn.init.xavier_uniform_(self.readout[2].weight)
+        nn.init.zeros_(self.readout[2].bias)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        pos: torch.Tensor,
+        batch: torch.Tensor,
+        node_struct_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        z: (N,) long
+        pos: (N, 3)
+        batch: (N,)
+        node_struct_feats: (N, NODE_STRUCT_DIM) or None
+        """
+        # 1) atomic number → scalar embedding
+        atom_emb = self.atom_emb(z)  # (N, atom_emb_dim)
+
+        # 2) node-level 구조 피쳐와 concat
+        if node_struct_feats is not None:
+            # 안전 장치: dtype/device 맞추기
+            node_struct_feats = node_struct_feats.to(
+                device=atom_emb.device,
+                dtype=atom_emb.dtype,
+            )
+            assert node_struct_feats.shape[0] == atom_emb.shape[0], \
+                "node_struct_feats and z must have same N"
+            assert node_struct_feats.shape[1] == self.node_scalar_dim, \
+                f"node_struct_feats dim {node_struct_feats.shape[1]} != {self.node_scalar_dim}"
+            x_scalar = torch.cat([atom_emb, node_struct_feats], dim=-1)
+        else:
+            # 구조 피쳐가 제공되지 않으면 0으로 패딩 (디버그/호환용)
+            pad = atom_emb.new_zeros(atom_emb.size(0), self.node_scalar_dim)
+            x_scalar = torch.cat([atom_emb, pad], dim=-1)
+
+        # scalar irreps 텐서로 보고 node irreps로 사상
+        x = self.scalar2node(x_scalar)  # (N, node_irreps.dim)
+
+        # 3) radius graph 생성 (torch-cluster 없이)
+        edge_index = build_radius_graph(pos, batch, self.radius)
+        src, dst = edge_index
+
+        # edge가 없을 수도 있는 edge case 처리
+        if edge_index.numel() == 0:
+            # 메시지패싱이 아무 것도 안 일어나므로, 바로 pooling으로 넘어감
+            B = int(batch.max().item()) + 1
+            hg = x.new_zeros((B, self.node_irreps.dim))
+            hg.index_add_(0, batch, x)
+            z_graph = self.readout(hg)
+            return z_graph
+
+        # 4) edge 방향 기반 spherical harmonics (한 번 계산)
+        rij = pos[dst] - pos[src]  # (E, 3)
+        sh = o3.spherical_harmonics(
+            self.edge_irreps,
+            rij,
+            normalize=True,
+            normalization='component'
+        )  # (E, edge_irreps.dim)
+
+        # 5) multi-layer equivariant message passing
+        for layer in self.layers:
+            x = layer(x, edge_index, sh)
+
+        # 6) batch-wise pooling (sum)
+        B = int(batch.max().item()) + 1
+        hg = x.new_zeros((B, self.node_irreps.dim))
+        hg.index_add_(0, batch, x)
+
+        # 7) latent projection
+        z_graph = self.readout(hg)  # (B, latent_dim)
+        return z_graph
+
+
+# ============================================================
+# 5. Invariant Decoder (latent → 구조 descriptor 재구성)
+# ============================================================
+
+class EquivDecoder(nn.Module):
+    """
+    구조-only self-supervised 학습용 invariant decoder.
+
+    - 입력: graph-level latent (B, latent_dim)
+    - 출력: 재구성 타깃 descriptor (B, desc_dim)
+
+    desc_dim은 train_encoder_qm9.py에서 정의하는
+    구조 descriptor (예: RDF + ADF + Shape) dimension과 맞춰야 한다.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = configs.LATENT_DIM,
+        desc_dim: int = configs.DESC_DIM,
+        hidden_dim: int = configs.DEC_HIDDEN_DIM,
+        num_layers: int = 3,
+    ):
+        super().__init__()
+        self.desc_dim = desc_dim
+
+        layers = []
+        in_dim = latent_dim
+        for _ in range(num_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, desc_dim))
+
+        self.net = nn.Sequential(*layers)
+
+        # 간단 초기화
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, z_graph: torch.Tensor) -> torch.Tensor:
+        """
+        z_graph: (B, latent_dim)
+        return: (B, desc_dim)
+        """
+        out = self.net(z_graph)
+        # 방어적 체크: 마지막 차원 desc_dim 확인
+        assert out.shape[-1] == self.desc_dim, \
+            f"Decoder output dim {out.shape[-1]} != desc_dim {self.desc_dim}"
+        return out
+
+
+__all__ = [
+    "ResidualBlock",
+    "ResidualMLP",
+    "EquivMPBlock",
+    "EquivGNNEncoder",
+    "EquivDecoder",
+]
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+sampling_mlp_experiment.py
+- QM9 latent 공간에서 샘플링 전략 비교
+    * Random sampling (uniform)
+    * Latent k-center (farthest-first) sampling
+    * Latent density-weighted random sampling (low-density 영역 우선 탐색)
+- 각 N (configs.SAMPLING_NS)에 대해:
+    * 선택된 subset으로 ResidualMLP 학습 (y: transform + scaling space)
+    * 고정 test set에서 MAE / RMSE / R2 평가 (raw HOMO space 기준)
+- 결과:
+    * results_random.csv
+    * results_kcenter.csv
+    * results_density.csv
+    * curve_mae.png (N vs MAE, random vs kcenter vs density)
+"""
+
+import os
+import argparse
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.neighbors import NearestNeighbors  # density용
+
+import configs
+import utils
+from models import ResidualMLP
+
+
+# ============================================================
+# k-center greedy (farthest-first) 샘플링
+# ============================================================
+def kcenter_greedy(
+    X: np.ndarray,
+    n_samples: int,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Latent 공간에서 farthest-first 방식의 k-center greedy.
+
+    X: (N, d) latent vector 배열
+    n_samples: 선택할 샘플 수
+    return: 선택된 index 배열 (shape: (n_samples,))
+    """
+    N = X.shape[0]
+    assert n_samples <= N, "n_samples must be <= N"
+
+    rng = np.random.RandomState(seed)
+
+    # 초기 center 랜덤 선택
+    first_idx = rng.randint(0, N)
+    centers = [first_idx]
+
+    # 각 포인트가 가장 가까운 center까지의 거리 (초기에는 ∞)
+    dist = np.full(N, np.inf, dtype=np.float64)
+
+    # 첫 center에 대해 거리 갱신
+    diff = X - X[first_idx]
+    dist = np.minimum(dist, np.linalg.norm(diff, axis=1))
+
+    for _ in tqdm(range(1, n_samples), desc="k-center greedy", ncols=100):
+        # 현재 center들과 가장 먼 포인트 선택
+        next_idx = int(np.argmax(dist))
+        centers.append(next_idx)
+
+        # 새 center 기준 거리 갱신
+        diff = X - X[next_idx]
+        dist = np.minimum(dist, np.linalg.norm(diff, axis=1))
+
+    return np.array(centers, dtype=np.int64)
+
+
+# ============================================================
+# Latent density 기반 inverse-density weights
+#  - low-density 영역일수록 샘플링 확률↑
+# ============================================================
+def compute_inverse_density_weights(
+    Z: np.ndarray,
+    k: int = None,
+    alpha: float = None,
+) -> np.ndarray:
+    """
+    Z: (N, d) latent (보통 z_train_proc: 표준화된 latent)
+    k: k-NN 이웃 수 (None이면 configs.DENSITY_KNN_K 또는 10)
+    alpha: sparsity 강조 정도 (None이면 configs.DENSITY_ALPHA 또는 1.0)
+
+    return: probs (N,) - 합이 1인 확률 벡터
+    """
+    if k is None:
+        k = getattr(configs, "DENSITY_KNN_K", 10)
+    if alpha is None:
+        alpha = getattr(configs, "DENSITY_ALPHA", 1.0)
+
+    N = Z.shape[0]
+    assert N > k, "N must be > k for density estimation"
+
+    # k+1: 자기 자신 + k neighbors → 자기 자신 제외
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto")
+    nbrs.fit(Z)
+    dists, _ = nbrs.kneighbors(Z)  # (N, k+1)
+    dists = dists[:, 1:]           # (N, k)
+
+    # k-NN 평균 거리 → local sparsity proxy
+    mean_d = dists.mean(axis=1)  # (N,)
+
+    eps = 1e-8
+    density = 1.0 / (mean_d + eps)      # local density
+    inv_density = 1.0 / (density + eps) # low-density → 큰 값
+
+    # sparsity 강조
+    weights = inv_density ** alpha
+
+    # 극단 outlier 보호용 clip (옵션)
+    p99 = np.percentile(weights, 99.0)
+    weights = np.minimum(weights, p99)
+
+    probs = weights / weights.sum()
+    return probs
+
+
+# ============================================================
+# Numpy → Torch Dataset
+# ============================================================
+class NumpyDataset(Dataset):
+    """단순 (X, y) numpy array용 Dataset."""
+
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        assert X.shape[0] == y.shape[0]
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.float32)
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        return (
+            torch.from_numpy(self.X[idx]),
+            torch.tensor(self.y[idx]),
+        )
+
+
+# ============================================================
+# ResidualMLP 학습 루프
+#   - y는 이미 (변환 + 스케일링된) space 상의 값
+#   - early stopping 포함
+# ============================================================
+def train_mlp(
+    z_train: np.ndarray,
+    y_train: np.ndarray,
+    z_val: np.ndarray,
+    y_val: np.ndarray,
+    logger,
+    desc: str = "MLP",
+) -> ResidualMLP:
+    """
+    선택된 subset으로 ResidualMLP를 한 번 학습하고, val에서 best 모델 반환.
+    (y는 이미 transform + scaling된 값이라고 가정)
+    Early stopping:
+        - configs.MAX_EPOCHS 번까지 학습
+        - configs.EARLY_STOP_PATIENCE 동안 val 개선 없으면 중단
+    """
+    device = utils.get_device()
+    utils.set_seed(configs.SEED)  # 내부 seed 재고정 (재현성)
+
+    input_dim = z_train.shape[1]
+    model = ResidualMLP(in_dim=input_dim).to(device)
+
+    train_dataset = NumpyDataset(z_train, y_train)
+    val_dataset = NumpyDataset(z_val, y_val)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=configs.MLP_BATCH_SIZE,
+        shuffle=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=configs.MLP_BATCH_SIZE,
+        shuffle=False
+    )
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=configs.MLP_LR,
+        weight_decay=configs.MLP_WEIGHT_DECAY
+    )
+
+    max_epochs = getattr(configs, "MAX_EPOCHS", configs.MLP_EPOCHS)
+    patience = getattr(configs, "EARLY_STOP_PATIENCE", 50)
+
+    best_val_loss = float("inf")
+    best_state_dict = None
+    no_improve_epochs = 0
+
+    for epoch in tqdm(range(1, max_epochs + 1), desc=desc, ncols=100):
+        # -----------------------------
+        # Train
+        # -----------------------------
+        model.train()
+        train_loss_sum = 0.0
+        n_train_batches = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            optimizer.zero_grad()
+            preds = model(xb)
+            loss = criterion(preds, yb)
+            loss.backward()
+            optimizer.step()
+
+            train_loss_sum += loss.item()
+            n_train_batches += 1
+
+        train_loss = train_loss_sum / max(1, n_train_batches)
+
+        # -----------------------------
+        # Validation
+        # -----------------------------
+        model.eval()
+        val_loss_sum = 0.0
+        n_val_batches = 0
+
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                preds = model(xb)
+                loss = criterion(preds, yb)
+
+                val_loss_sum += loss.item()
+                n_val_batches += 1
+
+        val_loss = val_loss_sum / max(1, n_val_batches)
+
+        if epoch == 1 or epoch % 50 == 0 or epoch == max_epochs:
+            logger.info(
+                f"[{desc}] Epoch {epoch}/{max_epochs} "
+                f"TrainLoss={train_loss:.6f}  ValLoss={val_loss:.6f}"
+            )
+
+        # -----------------------------
+        # Early stopping & best 모델 갱신
+        # -----------------------------
+        if val_loss < best_val_loss - 1e-6:
+            best_val_loss = val_loss
+            best_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+            if no_improve_epochs >= patience:
+                logger.info(
+                    f"[{desc}] Early stopping at epoch {epoch} "
+                    f"(no val improvement for {patience} epochs)."
+                )
+                break
+
+    logger.info(f"[{desc}] Best ValLoss={best_val_loss:.6f}")
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    return model
+
+
+# ============================================================
+# Evaluation
+#   - z_test_proc: (옵션) standardization된 latent
+#   - y_test_raw: "원래 HOMO 값" (변환/스케일링 전)
+# ============================================================
+@torch.no_grad()
+def eval_mlp(
+    model: ResidualMLP,
+    z_test_proc: np.ndarray,
+    y_test_raw: np.ndarray,
+    y_scaler_params: dict,
+    y_transform_mode: str,
+) -> tuple:
+    """
+    model: ResidualMLP (transform+scaling된 space에서 학습된 상태)
+    z_test_proc: (N_test, d) - (옵션) standardization 적용된 latent
+    y_test_raw: (N_test,) - 원래 HOMO 값
+    y_scaler_params: scale_y_fit 에서 얻은 params dict
+    y_transform_mode: configs.Y_TRANSFORM 값
+    """
+    device = utils.get_device()
+    model = model.to(device)
+    model.eval()
+
+    X_test = torch.from_numpy(z_test_proc.astype(np.float32)).to(device)
+    y_true_raw = np.asarray(y_test_raw, dtype=np.float32)
+
+    preds_scaled = model(X_test).cpu().numpy()  # (N_test, 1) or (N_test,)
+    preds_scaled = preds_scaled.reshape(-1).astype(np.float32)
+
+    # 1) scaling 역변환 (scaled → transformed space)
+    y_pred_trans = utils.inverse_scale_y(preds_scaled, y_scaler_params)
+
+    # 2) transform 역변환 (transformed → raw HOMO space)
+    y_pred_raw = utils.inverse_transform_y(y_pred_trans, y_transform_mode)
+
+    # metric은 "raw HOMO" 기준으로 계산
+    mae = utils.mae(y_true_raw, y_pred_raw)
+    rmse = utils.rmse(y_true_raw, y_pred_raw)
+    r2 = utils.r2_numpy(y_true_raw, y_pred_raw)
+
+    return mae, rmse, r2
+
+
+# ============================================================
+# 메인
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sampling experiment on QM9 latents (Random vs k-center vs density-weighted)"
+    )
+    parser.add_argument("--seed", type=int, default=configs.RANDOM_SEED)
+    parser.add_argument(
+        "--npz_path",
+        type=str,
+        default=configs.LATENT_NPZ_PATH,
+        help="Path to latents_qm9.npz"
+    )
+    parser.add_argument(
+        "--no_plot",
+        action="store_true",
+        help="Disables MAE curve plotting"
+    )
+    args = parser.parse_args()
+
+    # Seed & Logger
+    utils.set_seed(args.seed)
+    log_file = os.path.join(configs.RESULT_DIR, "sampling_mlp_experiment.log")
+    logger = utils.get_logger("sampling_mlp", log_file=log_file)
+
+    logger.info("===== Sampling MLP Experiment (Random vs k-center vs density) =====")
+    logger.info(f"NPZ path: {args.npz_path}")
+    logger.info(
+        f"Y_TRANSFORM={configs.Y_TRANSFORM}, "
+        f"Y_SCALING={configs.Y_SCALING}, "
+        f"Z_STANDARDIZE={configs.Z_STANDARDIZE}, "
+        f"MAX_EPOCHS={getattr(configs, 'MAX_EPOCHS', configs.MLP_EPOCHS)}, "
+        f"EARLY_STOP_PATIENCE={getattr(configs, 'EARLY_STOP_PATIENCE', 50)}"
+    )
+
+    # --------------------------------------------------------
+    # Latent npz 로드
+    # --------------------------------------------------------
+    data = np.load(args.npz_path, allow_pickle=True)
+    z_all: np.ndarray = data["z_all"]
+    y_all: np.ndarray = data["y_all"]
+    idx_train: np.ndarray = data["idx_train"]
+    idx_val: np.ndarray = data["idx_val"]
+    idx_test: np.ndarray = data["idx_test"]
+
+    logger.info(
+        f"z_all shape: {z_all.shape}, y_all shape: {y_all.shape} "
+        f"(train/val/test = {len(idx_train)}/{len(idx_val)}/{len(idx_test)})"
+    )
+
+    # Target 분포 요약 (raw HOMO)
+    hist_path = None
+    if getattr(configs, "Y_HIST_PLOT", False):
+        hist_path = os.path.join(configs.RESULT_DIR, "homo_hist_raw.png")
+    utils.describe_target(
+        y_all,
+        logger,
+        name="HOMO",
+        hist_out=hist_path,
+        bins=getattr(configs, "Y_HIST_BINS", 50),
+    )
+
+    # --------------------------------------------------------
+    # Target 변환 (예: signed_log1p)
+    # --------------------------------------------------------
+    y_all_trans = utils.transform_y(y_all, configs.Y_TRANSFORM)
+
+    # --------------------------------------------------------
+    # train/val/test 분할 (변환된 y 기준)
+    # --------------------------------------------------------
+    z_train = z_all[idx_train]
+    z_val = z_all[idx_val] if len(idx_val) > 0 else z_all[idx_train]
+    z_test = z_all[idx_test]
+
+    y_train_trans = y_all_trans[idx_train]
+    y_val_trans = y_all_trans[idx_val] if len(idx_val) > 0 else y_all_trans[idx_train]
+    y_test_trans = y_all_trans[idx_test]
+
+    # raw HOMO 값 (metrics용)
+    y_test_raw = y_all[idx_test]
+
+    # --------------------------------------------------------
+    # Latent Z standardization (옵션)
+    # --------------------------------------------------------
+    if configs.Z_STANDARDIZE:
+        logger.info("Applying feature-wise standardization to latent Z (train-based).")
+        z_train_proc, z_scaler_params = utils.standardize_features_fit(z_train)
+        z_val_proc = utils.standardize_features_apply(z_val, z_scaler_params)
+        z_test_proc = utils.standardize_features_apply(z_test, z_scaler_params)
+    else:
+        z_train_proc = z_train
+        z_val_proc = z_val
+        z_test_proc = z_test
+
+    # --------------------------------------------------------
+    # Target 스케일링 (train 기반)
+    # --------------------------------------------------------
+    y_train_scaled, y_scaler_params = utils.scale_y_fit(
+        y_train_trans,
+        mode=configs.Y_SCALING
+    )
+    y_val_scaled = utils.scale_y_apply(y_val_trans, y_scaler_params)
+    y_test_scaled = utils.scale_y_apply(y_test_trans, y_scaler_params)  # (직접 쓰진 않지만 일관성 유지)
+
+    logger.info(
+        f"Target scaling mode={y_scaler_params.get('mode', 'none')} "
+        f"(Y_TRANSFORM={configs.Y_TRANSFORM})"
+    )
+
+    # 사용할 N 리스트 (train size 보다 큰 값은 제거)
+    Ns = [n for n in configs.SAMPLING_NS if n <= len(z_train_proc)]
+    logger.info(f"Sampling Ns: {Ns}")
+
+    # --------------------------------------------------------
+    # k-center index 미리 계산 (가장 큰 N에 대해 한 번만)
+    # --------------------------------------------------------
+    max_N = max(Ns)
+    logger.info(f"Precomputing k-center indices for max N={max_N}...")
+    kcenter_indices_full = kcenter_greedy(
+        z_train_proc,
+        n_samples=max_N,
+        seed=args.seed + 1
+    )
+
+    # --------------------------------------------------------
+    # density-weighted sampling용 확률 벡터 한 번 계산
+    # --------------------------------------------------------
+    logger.info("Computing density-based sampling probabilities on latent space...")
+    density_probs = compute_inverse_density_weights(
+        z_train_proc,
+        k=getattr(configs, "DENSITY_KNN_K", 10),
+        alpha=getattr(configs, "DENSITY_ALPHA", 1.0),
+    )
+    logger.info(
+        f"Density probs: min={density_probs.min():.6e}, "
+        f"max={density_probs.max():.6e}, "
+        f"mean={density_probs.mean():.6e}"
+    )
+
+    # --------------------------------------------------------
+    # Random / k-center / density 에 대해 실험
+    # --------------------------------------------------------
+    results_random = {
+        "N": [],
+        "MAE": [],
+        "RMSE": [],
+        "R2": [],
+        "Y_TRANSFORM": [],
+        "Y_SCALING": [],
+        "Z_STANDARDIZE": [],
+    }
+    results_kcenter = {
+        "N": [],
+        "MAE": [],
+        "RMSE": [],
+        "R2": [],
+        "Y_TRANSFORM": [],
+        "Y_SCALING": [],
+        "Z_STANDARDIZE": [],
+    }
+    results_density = {
+        "N": [],
+        "MAE": [],
+        "RMSE": [],
+        "R2": [],
+        "Y_TRANSFORM": [],
+        "Y_SCALING": [],
+        "Z_STANDARDIZE": [],
+    }
+
+    rng = np.random.RandomState(args.seed + 123)
+
+    # ---------------- Random (uniform) ----------------
+    logger.info("### Random (uniform) sampling experiments ###")
+    for N in Ns:
+        logger.info(f"[Random] N = {N}")
+
+        rand_idx = rng.choice(len(z_train_proc), size=N, replace=False)
+        z_sub = z_train_proc[rand_idx]
+        y_sub = y_train_scaled[rand_idx]
+
+        model_r = train_mlp(
+            z_sub, y_sub,
+            z_val_proc, y_val_scaled,
+            logger,
+            desc=f"Random N={N}"
+        )
+
+        mae_r, rmse_r, r2_r = eval_mlp(
+            model_r,
+            z_test_proc,
+            y_test_raw,
+            y_scaler_params,
+            configs.Y_TRANSFORM
+        )
+        logger.info(
+            f"[Random] N={N}  "
+            f"MAE={mae_r:.5f}, RMSE={rmse_r:.5f}, R2={r2_r:.5f}"
+        )
+
+        results_random["N"].append(N)
+        results_random["MAE"].append(mae_r)
+        results_random["RMSE"].append(rmse_r)
+        results_random["R2"].append(r2_r)
+        results_random["Y_TRANSFORM"].append(configs.Y_TRANSFORM)
+        results_random["Y_SCALING"].append(configs.Y_SCALING)
+        results_random["Z_STANDARDIZE"].append(configs.Z_STANDARDIZE)
+
+    # ---------------- k-center ----------------
+    logger.info("### k-center sampling experiments ###")
+    for N in Ns:
+        logger.info(f"[k-center] N = {N}")
+
+        kc_idx = kcenter_indices_full[:N]
+        z_sub = z_train_proc[kc_idx]
+        y_sub = y_train_scaled[kc_idx]
+
+        model_k = train_mlp(
+            z_sub, y_sub,
+            z_val_proc, y_val_scaled,
+            logger,
+            desc=f"k-center N={N}"
+        )
+
+        mae_k, rmse_k, r2_k = eval_mlp(
+            model_k,
+            z_test_proc,
+            y_test_raw,
+            y_scaler_params,
+            configs.Y_TRANSFORM
+        )
+        logger.info(
+            f"[k-center] N={N}  "
+            f"MAE={mae_k:.5f}, RMSE={rmse_k:.5f}, R2={r2_k:.5f}"
+        )
+
+        results_kcenter["N"].append(N)
+        results_kcenter["MAE"].append(mae_k)
+        results_kcenter["RMSE"].append(rmse_k)
+        results_kcenter["R2"].append(r2_k)
+        results_kcenter["Y_TRANSFORM"].append(configs.Y_TRANSFORM)
+        results_kcenter["Y_SCALING"].append(configs.Y_SCALING)
+        results_kcenter["Z_STANDARDIZE"].append(configs.Z_STANDARDIZE)
+
+    # ---------------- Density-weighted ----------------
+    logger.info("### Density-weighted sampling experiments ###")
+    for N in Ns:
+        logger.info(f"[Density] N = {N}")
+
+        dens_idx = rng.choice(
+            len(z_train_proc),
+            size=N,
+            replace=False,
+            p=density_probs
+        )
+        z_sub = z_train_proc[dens_idx]
+        y_sub = y_train_scaled[dens_idx]
+
+        model_d = train_mlp(
+            z_sub, y_sub,
+            z_val_proc, y_val_scaled,
+            logger,
+            desc=f"Density N={N}"
+        )
+
+        mae_d, rmse_d, r2_d = eval_mlp(
+            model_d,
+            z_test_proc,
+            y_test_raw,
+            y_scaler_params,
+            configs.Y_TRANSFORM
+        )
+        logger.info(
+            f"[Density] N={N}  "
+            f"MAE={mae_d:.5f}, RMSE={rmse_d:.5f}, R2={r2_d:.5f}"
+        )
+
+        results_density["N"].append(N)
+        results_density["MAE"].append(mae_d)
+        results_density["RMSE"].append(rmse_d)
+        results_density["R2"].append(r2_d)
+        results_density["Y_TRANSFORM"].append(configs.Y_TRANSFORM)
+        results_density["Y_SCALING"].append(configs.Y_SCALING)
+        results_density["Z_STANDARDIZE"].append(configs.Z_STANDARDIZE)
+
+    # --------------------------------------------------------
+    # 결과 저장 (CSV + MAE 곡선)
+    # --------------------------------------------------------
+    os.makedirs(configs.RESULT_DIR, exist_ok=True)
+
+    df_random = pd.DataFrame(results_random)
+    df_kcenter = pd.DataFrame(results_kcenter)
+    df_density = pd.DataFrame(results_density)
+
+    random_csv = os.path.join(configs.RESULT_DIR, "results_random.csv")
+    kcenter_csv = os.path.join(configs.RESULT_DIR, "results_kcenter.csv")
+    density_csv = os.path.join(configs.RESULT_DIR, "results_density.csv")
+
+    df_random.to_csv(random_csv, index=False)
+    df_kcenter.to_csv(kcenter_csv, index=False)
+    df_density.to_csv(density_csv, index=False)
+
+    logger.info(f"Saved random results to: {random_csv}")
+    logger.info(f"Saved k-center results to: {kcenter_csv}")
+    logger.info(f"Saved density results to: {density_csv}")
+
+    # MAE 곡선 플롯
+    if not args.no_plot:
+        mae_dict = {
+            "random": results_random["MAE"],
+            "k-center": results_kcenter["MAE"],
+            "density": results_density["MAE"],
+        }
+        mae_png = os.path.join(configs.RESULT_DIR, "curve_mae.png")
+        utils.save_learning_curve(
+            x_values=Ns,
+            y_dict=mae_dict,
+            out_png=mae_png,
+            xlabel="# train samples",
+            ylabel="MAE (HOMO)",
+            title="Random vs k-center vs density sampling (QM9 latents)",
+        )
+        logger.info(f"Saved MAE curve to: {mae_png}")
+
+    logger.info("Sampling MLP experiment finished. ✅")
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_encoder_qm9.py
+- QM9 구조-only self-supervised 학습
+- EquivGNNEncoder + Invariant Decoder 로 구조 descriptor 재구성
+- 학습 완료 후 전체 QM9에 대한 latent z 및 HOMO y를 npz로 저장
+
+출력:
+- encoder/decoder 체크포인트: checkpoints/encoder_struct.pt, decoder_struct.pt
+- latent npz: configs.LATENT_NPZ_PATH (latents_qm9.npz)
+    * z_all: (N_mol, LATENT_DIM)
+    * y_all: (N_mol,)
+    * idx_train, idx_val, idx_test: split index
+"""
+
+import os
+import argparse
+
+import numpy as np
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+
+from torch_geometric.datasets import QM9
+from torch_geometric.loader import DataLoader as PyGDataLoader
+
+import configs
+import utils
+from models import EquivGNNEncoder, EquivDecoder
+
+
+# ============================================================
+# 구조 descriptor: RDF + ADF + Shape 조합
+# ============================================================
+
+def build_structural_descriptor(pos: torch.Tensor) -> torch.Tensor:
+    """단일 분자에 대한 구조 descriptor 생성.
+
+    구성:
+        - RDF (Radial Distribution Function)
+        - ADF (Angular Distribution Function) [옵션]
+        - Global shape (inertia eigenvalues + Rg) [옵션]
+
+    configs.DESC_USE_* 플래그와 DESC_DIM을 기준으로 길이 검증.
+    반환: (DESC_DIM,) tensor (CPU)
+    """
+    # CPU에서 계산 (캐시용)
+    if isinstance(pos, torch.Tensor):
+        pos_cpu = pos.detach().cpu()
+    else:
+        pos_cpu = torch.as_tensor(pos, dtype=torch.float32)
+
+    desc_parts = []
+
+    if configs.DESC_USE_RDF:
+        rdf = utils.compute_rdf_descriptor(pos_cpu)  # (2 * DESC_NUM_BINS_R,)
+        desc_parts.append(rdf)
+
+    if configs.DESC_USE_ADF:
+        adf = utils.compute_adf_descriptor(pos_cpu)  # (2 * DESC_NUM_BINS_ANGLE,)
+        desc_parts.append(adf)
+
+    if configs.DESC_USE_SHAPE:
+        shape = utils.compute_shape_descriptor(pos_cpu)  # (4,)
+        desc_parts.append(shape)
+
+    if len(desc_parts) == 0:
+        # 이론상 발생하지 않게 configs에서 보장하는 게 좋지만, 방어코드
+        desc = torch.zeros(configs.DESC_DIM, dtype=torch.float32)
+    else:
+        desc = torch.cat(desc_parts, dim=0).to(torch.float32)
+
+    assert desc.shape[0] == configs.DESC_DIM, (
+        f"Structural descriptor dim mismatch: got {desc.shape[0]}, "
+        f"expected {configs.DESC_DIM}"
+    )
+    return desc
+
+
+# ============================================================
+# 학습 루프 (encoder + decoder)
+# ============================================================
+
+def train_one_epoch(
+    encoder: EquivGNNEncoder,
+    decoder: EquivDecoder,
+    loader: PyGDataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    criterion: nn.Module,
+) -> float:
+    encoder.train()
+    decoder.train()
+
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in tqdm(loader, desc="Train encoder", ncols=100):
+        batch = batch.to(device)
+        optimizer.zero_grad()
+
+        # 구조 latent (node-level 구조 피쳐 포함)
+        z_graph = encoder(
+            batch.z,
+            batch.pos,
+            batch.batch,
+            node_struct_feats=batch.node_struct_feats,
+        )
+        # 구조 descriptor target (graph-wise)
+        target_desc = batch.struct_desc.to(device)
+
+        pred_desc = decoder(z_graph)
+
+        loss = criterion(pred_desc, target_desc)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / max(1, n_batches)
+
+
+@torch.no_grad()
+def eval_one_epoch(
+    encoder: EquivGNNEncoder,
+    decoder: EquivDecoder,
+    loader: PyGDataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+) -> float:
+    encoder.eval()
+    decoder.eval()
+
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in tqdm(loader, desc="Val encoder", ncols=100):
+        batch = batch.to(device)
+
+        z_graph = encoder(
+            batch.z,
+            batch.pos,
+            batch.batch,
+            node_struct_feats=batch.node_struct_feats,
+        )
+        target_desc = batch.struct_desc.to(device)
+        pred_desc = decoder(z_graph)
+
+        loss = criterion(pred_desc, target_desc)
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / max(1, n_batches)
+
+
+# ============================================================
+# 전체 latent 추출
+# ============================================================
+
+@torch.no_grad()
+def extract_latents(
+    encoder: EquivGNNEncoder,
+    loader: PyGDataLoader,
+    device: torch.device
+) -> np.ndarray:
+    encoder.eval()
+
+    all_latents = []
+
+    for batch in tqdm(loader, desc="Extract latents", ncols=100):
+        batch = batch.to(device)
+        z_graph = encoder(
+            batch.z,
+            batch.pos,
+            batch.batch,
+            node_struct_feats=batch.node_struct_feats,
+        )  # (B, latent_dim)
+        all_latents.append(z_graph.cpu().numpy())
+
+    z_all = np.concatenate(all_latents, axis=0)  # (N_mol, latent_dim)
+    return z_all
+
+
+# ============================================================
+# 메인
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Train EquivGNN encoder on QM9")
+    parser.add_argument("--epochs", type=int, default=configs.ENC_EPOCHS)
+    parser.add_argument("--batch_size", type=int, default=configs.ENC_BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=configs.ENC_LR)
+    parser.add_argument("--weight_decay", type=float, default=configs.ENC_WEIGHT_DECAY)
+    parser.add_argument("--seed", type=int, default=configs.SEED)
+    parser.add_argument("--latent_dim", type=int, default=configs.LATENT_DIM)
+    args = parser.parse_args()
+
+    # ----------------------------------------------
+    # Seed & Device & Logger
+    # ----------------------------------------------
+    utils.set_seed(args.seed)
+    device = utils.get_device()
+
+    log_file = os.path.join(configs.RESULT_DIR, "train_encoder_qm9.log")
+    logger = utils.get_logger("train_encoder_qm9", log_file=log_file)
+
+    logger.info("===== Train EquivGNN Encoder on QM9 (self-supervised) =====")
+    logger.info(f"Device: {device}")
+    logger.info(f"Epochs: {args.epochs}, BatchSize: {args.batch_size}, LR: {args.lr}")
+    logger.info(f"Latent dim: {args.latent_dim}")
+    logger.info(
+        "Descriptor config: "
+        f"DESC_DIM={configs.DESC_DIM}, "
+        f"USE_RDF={configs.DESC_USE_RDF}, "
+        f"USE_ADF={configs.DESC_USE_ADF}, "
+        f"USE_SHAPE={configs.DESC_USE_SHAPE}, "
+        f"NODE_STRUCT_DIM={configs.NODE_STRUCT_DIM}, "
+        f"NODE_RADIUS={configs.NODE_RADIUS}"
+    )
+
+    # ----------------------------------------------
+    # QM9 Dataset 로드
+    # ----------------------------------------------
+    qm9_root = os.path.join(configs.DATA_ROOT, "qm9")
+    logger.info(f"Loading QM9 dataset from: {qm9_root}")
+    dataset = QM9(root=qm9_root)
+
+    logger.info(f"QM9 total molecules (raw): {len(dataset)}")
+
+    # ----------------------------------------------
+    # 구조 descriptor 캐시 사용 (있으면 로드, 없으면 계산 후 저장)
+    #  - 캐시에는 graph-level descriptor만 저장
+    #  - node-level 구조 피쳐는 매 실행마다 다시 계산 (QM9 크기에서 비용 부담 적음)
+    # ----------------------------------------------
+    cache_path = getattr(configs, "DESC_CACHE_PATH", None)
+
+    data_list = []
+    if cache_path is not None and os.path.exists(cache_path):
+        # ===== 1) 캐시 파일이 이미 있는 경우: 로드해서 붙이기 =====
+        logger.info(f"Found descriptor cache at: {cache_path}")
+        struct_desc_all = torch.load(cache_path, map_location="cpu")
+        # struct_desc_all: (N_data, DESC_DIM) 가정
+
+        assert struct_desc_all.shape[0] == len(dataset), \
+            "Descriptor cache size does not match QM9 dataset size."
+
+        for i, data in enumerate(dataset):
+            desc = struct_desc_all[i]              # (DESC_DIM,)
+            data.struct_desc = desc.unsqueeze(0)   # (1, DESC_DIM)
+
+            # node-level 구조 피쳐는 매 실행 시 계산
+            cn, mean_d, min_d, max_d = utils.compute_cn_and_dist_stats(
+                data.pos, radius=configs.NODE_RADIUS
+            )
+            node_feats = utils.pack_node_struct_feats(cn, mean_d, min_d, max_d)
+            data.node_struct_feats = node_feats  # (N_atoms, NODE_STRUCT_DIM)
+
+            data_list.append(data)
+
+        logger.info("Loaded structural descriptors from cache and recomputed node features.")
+
+    else:
+        # ===== 2) 캐시가 없으면: 새로 계산하고 저장 =====
+        logger.info("Precomputing structural descriptors and node features for all molecules...")
+
+        desc_list = []
+
+        for data in tqdm(dataset, desc="Build descriptors & node feats", ncols=100):
+            # graph-level descriptor
+            desc = build_structural_descriptor(data.pos)  # (DESC_DIM,)
+            data.struct_desc = desc.unsqueeze(0)          # (1, DESC_DIM)
+            desc_list.append(desc.cpu())
+
+            # node-level 구조 피쳐
+            cn, mean_d, min_d, max_d = utils.compute_cn_and_dist_stats(
+                data.pos, radius=configs.NODE_RADIUS
+            )
+            node_feats = utils.pack_node_struct_feats(cn, mean_d, min_d, max_d)
+            data.node_struct_feats = node_feats  # (N_atoms, NODE_STRUCT_DIM)
+
+            data_list.append(data)
+
+        logger.info("Finished structural descriptor & node feature precomputation.")
+
+        # desc_list를 하나의 텐서로 쌓아서 캐시 파일로 저장
+        if cache_path is not None:
+            struct_desc_all = torch.stack(desc_list, dim=0)  # (N_data, DESC_DIM)
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            torch.save(struct_desc_all, cache_path)
+            logger.info(f"Saved structural descriptor cache to: {cache_path}")
+
+    # descriptor + node feature까지 포함된 유효 데이터 개수 기준
+    N_data = len(data_list)
+    logger.info(f"Effective dataset size (with descriptors & node features): {N_data}")
+
+    # ----------------------------------------------
+    # Train / Val / Test split (data_list 기준)
+    # ----------------------------------------------
+    idx_train, idx_val, idx_test = utils.train_val_test_split_indices(
+        N_data,
+        configs.TRAIN_VAL_TEST_SPLIT,
+        seed=args.seed
+    )
+    logger.info(
+        f"Split sizes - train: {len(idx_train)}, "
+        f"val: {len(idx_val)}, test: {len(idx_test)}"
+    )
+
+    # 인덱스로 리스트 슬라이싱해서 서브셋 구성
+    train_subset = [data_list[i] for i in idx_train]
+    val_subset = [data_list[i] for i in idx_val]
+
+    # full_loader는 latent 추출용 (train/val/test 전체)
+    full_dataset = data_list
+    full_loader = PyGDataLoader(
+        full_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=configs.NUM_WORKERS,
+        pin_memory=configs.PIN_MEMORY
+    )
+
+    train_loader = PyGDataLoader(
+        train_subset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=configs.NUM_WORKERS,
+        pin_memory=configs.PIN_MEMORY
+    )
+
+    val_loader = None
+    if len(idx_val) > 0:
+        val_loader = PyGDataLoader(
+            val_subset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=configs.NUM_WORKERS,
+            pin_memory=configs.PIN_MEMORY
+        )
+
+    # ----------------------------------------------
+    # 모델/옵티마 초기화
+    # ----------------------------------------------
+    encoder = EquivGNNEncoder(latent_dim=args.latent_dim).to(device)
+    decoder = EquivDecoder(
+        latent_dim=args.latent_dim,
+        desc_dim=configs.DESC_DIM
+    ).to(device)
+
+    params = list(encoder.parameters()) + list(decoder.parameters())
+    optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
+    criterion = nn.MSELoss()
+
+    best_val_loss = float("inf")
+    best_epoch = -1
+
+    encoder_ckpt_path = os.path.join(configs.MODEL_DIR, "encoder_struct.pt")
+    decoder_ckpt_path = os.path.join(configs.MODEL_DIR, "decoder_struct.pt")
+    os.makedirs(configs.MODEL_DIR, exist_ok=True)
+
+    # ----------------------------------------------
+    # 학습 루프
+    # ----------------------------------------------
+    for epoch in range(1, args.epochs + 1):
+        logger.info(f"=== Epoch {epoch}/{args.epochs} ===")
+
+        train_loss = train_one_epoch(
+            encoder, decoder, train_loader,
+            optimizer, device, criterion
+        )
+        logger.info(f"Train loss: {train_loss:.6f}")
+
+        if val_loader is not None:
+            val_loss = eval_one_epoch(
+                encoder, decoder, val_loader, device, criterion
+            )
+            logger.info(f"Val loss:   {val_loss:.6f}")
+        else:
+            val_loss = train_loss
+
+        # Best 모델 저장
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+
+            torch.save(encoder.state_dict(), encoder_ckpt_path)
+            torch.save(decoder.state_dict(), decoder_ckpt_path)
+            logger.info(
+                f"  >> New best model saved (epoch {epoch}, val_loss={val_loss:.6f})"
+            )
+
+    logger.info(
+        f"Training finished. Best epoch: {best_epoch}, best val_loss: {best_val_loss:.6f}"
+    )
+
+    # ----------------------------------------------
+    # Best encoder 로드 후 전체 latent 추출
+    # ----------------------------------------------
+    logger.info("Loading best encoder checkpoint and extracting latents...")
+    encoder.load_state_dict(torch.load(encoder_ckpt_path, map_location=device))
+
+    z_all = extract_latents(encoder, full_loader, device)  # (N, latent_dim)
+
+    # ----------------------------------------------
+    # QM9 HOMO 값 y_all 추출
+    # ----------------------------------------------
+    logger.info("Extracting HOMO values from QM9 dataset...")
+    target_idx = configs.QM9_HOMO_TARGET_INDEX
+
+    y_all_list = []
+    for data in data_list:
+        # PyG QM9: data.y shape (1, 19) or (19,)
+        y = data.y.view(-1)
+        y_homo = y[target_idx].item()
+        y_all_list.append(y_homo)
+
+    y_all = np.array(y_all_list, dtype=np.float32)
+
+    assert z_all.shape[0] == y_all.shape[0] == N_data, \
+        "z_all / y_all length mismatch"
+
+    # ----------------------------------------------
+    # latent + target + split index 저장
+    # ----------------------------------------------
+    npz_path = configs.LATENT_NPZ_PATH
+    os.makedirs(os.path.dirname(npz_path), exist_ok=True)
+
+    logger.info(f"Saving latents and splits to: {npz_path}")
+    np.savez_compressed(
+        npz_path,
+        z_all=z_all,
+        y_all=y_all,
+        idx_train=idx_train,
+        idx_val=idx_val,
+        idx_test=idx_test,
+    )
+    logger.info("All done. ✅")
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+utils.py
+- seed 고정
+- metric 계산 (numpy / torch)
+- logging 세팅 (RotatingFileHandler 포함)
+- device 헬퍼
+- train/val/test split
+- 학습 곡선 플롯 (샘플 수 vs MAE)
+- target 변환/스케일링 유틸
+- 구조 기반 descriptor 유틸:
+    * per-atom CN / neighbor distance stats
+    * node-level 구조 피쳐 패킹
+    * RDF / ADF / global shape descriptor
+"""
+
+import os
+import math
+import random
+import logging
+from logging.handlers import RotatingFileHandler
+from typing import Tuple, Dict, List
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+import configs  # LOG_LEVEL, SEED, DESC_* 등 사용
+
+
+# ==============================
+# Seed 고정
+# ==============================
+def set_seed(seed: int) -> None:
+    """random / numpy / torch / cuda 모두 seed 고정."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        # 완전 재현성을 원하면 deterministic 설정
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+# ==============================
+# Device 헬퍼
+# ==============================
+def get_device() -> torch.device:
+    """cuda 사용 가능하면 cuda, 아니면 cpu."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ==============================
+# Metric 계산 (numpy 버전)
+# ==============================
+def mae_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def rmse_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def r2_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    if ss_tot == 0:
+        return 0.0
+    return float(1 - ss_res / ss_tot)
+
+
+# ---- alias (다른 스크립트에서 mae, rmse, r2_numpy 이름으로도 사용 가능하게) ----
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for mae_np (편의용)."""
+    return mae_np(y_true, y_pred)
+
+
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for rmse_np (편의용)."""
+    return rmse_np(y_true, y_pred)
+
+
+def r2_numpy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for r2_np (이름 취향용)."""
+    return r2_np(y_true, y_pred)
+
+
+# ==============================
+# Metric 계산 (torch 버전)
+# ==============================
+def mae_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    return float(torch.mean(torch.abs(y_true - y_pred)).item())
+
+
+def rmse_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    return float(torch.sqrt(torch.mean((y_true - y_pred) ** 2)).item())
+
+
+def r2_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    y_true = y_true.detach()
+    y_pred = y_pred.detach()
+    ss_res = torch.sum((y_true - y_pred) ** 2)
+    ss_tot = torch.sum((y_true - torch.mean(y_true)) ** 2)
+    if ss_tot.item() == 0:
+        return 0.0
+    return float(1 - ss_res / ss_tot)
+
+
+# ==============================
+# Logging 세팅
+# ==============================
+def get_logger(
+    name: str,
+    log_file: str = None,
+    level: str = None
+) -> logging.Logger:
+    """
+    RotatingFileHandler + 콘솔 핸들러를 사용하는 logger 생성.
+    - name: logger 이름
+    - log_file: 파일로도 남기고 싶으면 경로 지정 (None이면 파일 로깅 없음)
+    - level: "DEBUG" / "INFO" 등 (None이면 configs.LOG_LEVEL 사용)
+    """
+    logger = logging.getLogger(name)
+
+    # 이미 핸들러가 있으면 중복 추가 방지
+    if logger.handlers:
+        return logger
+
+    if level is None:
+        level = getattr(configs, "LOG_LEVEL", "INFO")
+
+    logger.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # 콘솔 핸들러
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    # 파일 핸들러 (선택)
+    if log_file is not None:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        fh = RotatingFileHandler(
+            log_file,
+            maxBytes=10_000_000,
+            backupCount=5
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    return logger
+
+
+# ==============================
+# Train/Val/Test Split
+# ==============================
+def train_val_test_split_indices(
+    N: int,
+    ratios: Tuple[float, float, float],
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    전체 N개 인덱스를 ratios 비율로 나눈 train/val/test 인덱스 반환.
+    """
+    assert len(ratios) == 3, "ratios must be (train, val, test)"
+    train_r, val_r, test_r = ratios
+    assert abs(train_r + val_r + test_r - 1.0) < 1e-6, "ratios must sum to 1"
+
+    rng = np.random.RandomState(seed)
+    indices = np.arange(N)
+    rng.shuffle(indices)
+
+    n_train = int(N * train_r)
+    n_val = int(N * val_r)
+
+    idx_train = indices[:n_train]
+    idx_val = indices[n_train:n_train + n_val]
+    idx_test = indices[n_train + n_val:]
+
+    return idx_train, idx_val, idx_test
+
+
+# ==============================
+# 학습 곡선 플롯 (샘플 수 vs MAE)
+# ==============================
+def save_learning_curve(
+    x_values: List[int],
+    y_dict: Dict[str, List[float]],
+    out_png: str,
+    xlabel: str = "# train samples",
+    ylabel: str = "MAE",
+    title: str = "Sampling comparison"
+) -> None:
+    """
+    x_values: N 리스트 (예: [10, 20, 50, ...])
+    y_dict: {"random": [..], "latent": [..]} 형식
+    """
+    plt.figure(figsize=(8, 5))
+    for label, ys in y_dict.items():
+        plt.plot(x_values, ys, marker="o", label=label)
+
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(alpha=0.3)
+    plt.legend()
+
+    out_dir = os.path.dirname(out_png)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.close()
+
+
+# ==============================
+# Target(HOMO 등) 분포 요약 + 히스토그램
+# ==============================
+def describe_target(
+    y: np.ndarray,
+    logger: logging.Logger,
+    name: str = "target",
+    hist_out: str = None,
+    bins: int = 50
+) -> None:
+    """
+    y 분포에 대한 기본 통계 + (옵션) 히스토그램 PNG 저장.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    mean = np.mean(y)
+    std = np.std(y)
+    y_min = np.min(y)
+    y_max = np.max(y)
+    p1, p50, p99 = np.percentile(y, [1, 50, 99])
+
+    logger.info(
+        f"{name} stats (raw): "
+        f"mean={mean:.4f}, std={std:.4f}, min={y_min:.4f}, max={y_max:.4f}, "
+        f"p1={p1:.4f}, p50={p50:.4f}, p99={p99:.4f}"
+    )
+
+    if hist_out is not None:
+        out_dir = os.path.dirname(hist_out)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        plt.figure(figsize=(6, 4))
+        plt.hist(y, bins=bins, alpha=0.75)
+        plt.xlabel(name)
+        plt.ylabel("Count")
+        plt.title(f"Histogram of {name}")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(hist_out, dpi=300)
+        plt.close()
+        logger.info(f"{name} histogram saved to: {hist_out}")
+
+
+# ==============================
+# Target 변환 (예: signed_log1p)
+# ==============================
+def transform_y(y: np.ndarray, mode: str = "none") -> np.ndarray:
+    """
+    y → y_trans (training space 변환)
+    mode:
+        - "none"         : 그대로
+        - "signed_log1p" : sign(y) * log(1 + |y|)
+    """
+    y = np.asarray(y, dtype=np.float32)
+
+    if mode is None or mode.lower() == "none":
+        return y.copy()
+
+    mode = mode.lower()
+    if mode == "signed_log1p":
+        return np.sign(y) * np.log1p(np.abs(y)).astype(np.float32)
+
+    # 알 수 없는 모드는 경고 후 그대로 반환
+    print(f"[WARN] transform_y: unknown mode '{mode}', using 'none'")
+    return y.copy()
+
+
+def inverse_transform_y(y_trans: np.ndarray, mode: str = "none") -> np.ndarray:
+    """
+    y_trans → y_raw (역변환)
+    mode:
+        - "none"         : 그대로
+        - "signed_log1p" : sign(y) * (exp(|y|) - 1)
+    """
+    y_trans = np.asarray(y_trans, dtype=np.float32)
+
+    if mode is None or mode.lower() == "none":
+        return y_trans.copy()
+
+    mode = mode.lower()
+    if mode == "signed_log1p":
+        return np.sign(y_trans) * (np.expm1(np.abs(y_trans))).astype(np.float32)
+
+    print(f"[WARN] inverse_transform_y: unknown mode '{mode}', using 'none'")
+    return y_trans.copy()
+
+
+# ==============================
+# Target 스케일링 (standard / robust)
+# ==============================
+def scale_y_fit(
+    y: np.ndarray,
+    mode: str = "none"
+) -> Tuple[np.ndarray, Dict]:
+    """
+    y (1D) 를 주면, mode에 따라 스케일링된 y와 파라미터 dict를 반환.
+    mode:
+        - "none"     : 그대로
+        - "standard" : (y - mean) / std
+        - "robust"   : (y - median) / IQR
+    """
+    y = np.asarray(y, dtype=np.float32)
+
+    if mode is None or mode.lower() == "none":
+        params = {"mode": "none"}
+        return y.copy(), params
+
+    mode = mode.lower()
+    if mode == "standard":
+        mean = float(np.mean(y))
+        std = float(np.std(y))
+        if std < 1e-8:
+            std = 1.0
+        y_scaled = (y - mean) / std
+        params = {"mode": "standard", "mean": mean, "std": std}
+        return y_scaled.astype(np.float32), params
+
+    if mode == "robust":
+        median = float(np.median(y))
+        q1, q3 = np.percentile(y, [25, 75])
+        iqr = float(q3 - q1)
+        if iqr < 1e-8:
+            iqr = 1.0
+        y_scaled = (y - median) / iqr
+        params = {"mode": "robust", "median": median, "iqr": iqr}
+        return y_scaled.astype(np.float32), params
+
+    print(f"[WARN] scale_y_fit: unknown mode '{mode}', using 'none'")
+    params = {"mode": "none"}
+    return y.copy(), params
+
+
+def scale_y_apply(
+    y: np.ndarray,
+    params: Dict
+) -> np.ndarray:
+    """
+    fit된 params를 사용하여 y에 동일 스케일링 적용.
+    """
+    y = np.asarray(y, dtype=np.float32)
+    mode = params.get("mode", "none").lower()
+
+    if mode == "none":
+        return y.copy()
+
+    if mode == "standard":
+        mean = params["mean"]
+        std = params["std"]
+        return ((y - mean) / std).astype(np.float32)
+
+    if mode == "robust":
+        median = params["median"]
+        iqr = params["iqr"]
+        return ((y - median) / iqr).astype(np.float32)
+
+    print(f"[WARN] scale_y_apply: unknown mode '{mode}', using 'none'")
+    return y.copy()
+
+
+def inverse_scale_y(
+    y_scaled: np.ndarray,
+    params: Dict
+) -> np.ndarray:
+    """
+    스케일링된 y_scaled를 params 기준으로 원래 스케일로 복원.
+    """
+    y_scaled = np.asarray(y_scaled, dtype=np.float32)
+    mode = params.get("mode", "none").lower()
+
+    if mode == "none":
+        return y_scaled.copy()
+
+    if mode == "standard":
+        mean = params["mean"]
+        std = params["std"]
+        return (y_scaled * std + mean).astype(np.float32)
+
+    if mode == "robust":
+        median = params["median"]
+        iqr = params["iqr"]
+        return (y_scaled * iqr + median).astype(np.float32)
+
+    print(f"[WARN] inverse_scale_y: unknown mode '{mode}', using 'none'")
+    return y_scaled.copy()
+
+
+# ==============================
+# Latent Z standardization (옵션)
+# ==============================
+def standardize_features_fit(
+    X: np.ndarray,
+    eps: float = 1e-8
+) -> Tuple[np.ndarray, Dict]:
+    """
+    X: (N, d) 에 대해 feature-wise standardization.
+    return: X_scaled, {"mean": mean(d,), "std": std(d,)}
+    """
+    X = np.asarray(X, dtype=np.float32)
+    mean = X.mean(axis=0)
+    std = X.std(axis=0)
+    std = np.where(std < eps, 1.0, std)
+    X_scaled = (X - mean) / std
+    params = {
+        "mean": mean.astype(np.float32),
+        "std": std.astype(np.float32),
+    }
+    return X_scaled.astype(np.float32), params
+
+
+def standardize_features_apply(
+    X: np.ndarray,
+    params: Dict,
+    eps: float = 1e-8
+) -> np.ndarray:
+    """
+    fit된 params를 사용하여 X에 동일한 standardization 적용.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    mean = params["mean"]
+    std = params["std"]
+    std = np.where(std < eps, 1.0, std)
+    X_scaled = (X - mean) / std
+    return X_scaled.astype(np.float32)
+
+
+# ============================================================
+# 구조 기반 descriptor 유틸
+#   - per-atom CN / distance stats
+#   - node-level scalar feature 패킹
+#   - RDF / ADF / global shape descriptor
+# ============================================================
+
+def _ensure_tensor_pos(pos: torch.Tensor) -> torch.Tensor:
+    """
+    pos를 float32 torch.Tensor로 보장.
+    - 입력이 numpy array여도 허용.
+    - device 정보는 유지(텐서면 그대로).
+    """
+    if isinstance(pos, torch.Tensor):
+        return pos.to(dtype=torch.float32)
+    # numpy or list → CPU tensor
+    return torch.as_tensor(pos, dtype=torch.float32)
+
+
+def compute_cn_and_dist_stats(
+    pos: torch.Tensor,
+    radius: float
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    각 atom에 대해 neighbor 기반 CN / min/mean/max distance 계산.
+
+    입력:
+        pos   : (N, 3) 좌표 (torch.Tensor or np.ndarray)
+        radius: neighbor cutoff
+
+    출력 (모두 (N,) on pos.device):
+        cn     : coordination number (float)
+        mean_d : neighbor 거리 평균 (이웃 없으면 0)
+        min_d  : neighbor 거리 최소 (이웃 없으면 0)
+        max_d  : neighbor 거리 최대 (이웃 없으면 0)
+    """
+    pos = _ensure_tensor_pos(pos)
+    device = pos.device
+    N = pos.size(0)
+
+    if N == 0:
+        zeros = torch.zeros(0, device=device)
+        return zeros, zeros, zeros, zeros
+
+    # pairwise 거리 행렬 (N, N)
+    dists = torch.cdist(pos, pos, p=2)  # 자기 자신 포함, 0
+
+    cn_list = []
+    mean_list = []
+    min_list = []
+    max_list = []
+
+    for i in range(N):
+        # 자신 제외 & cutoff 이내 neighbor
+        mask = (dists[i] > 0.0) & (dists[i] <= radius)
+        neigh_d = dists[i][mask]
+
+        if neigh_d.numel() == 0:
+            cn_list.append(torch.tensor(0.0, device=device))
+            mean_list.append(torch.tensor(0.0, device=device))
+            min_list.append(torch.tensor(0.0, device=device))
+            max_list.append(torch.tensor(0.0, device=device))
+        else:
+            cn_list.append(torch.tensor(float(neigh_d.numel()), device=device))
+            mean_list.append(torch.mean(neigh_d))
+            min_list.append(torch.min(neigh_d))
+            max_list.append(torch.max(neigh_d))
+
+    cn = torch.stack(cn_list)
+    mean_d = torch.stack(mean_list)
+    min_d = torch.stack(min_list)
+    max_d = torch.stack(max_list)
+
+    return cn, mean_d, min_d, max_d
+
+
+def pack_node_struct_feats(
+    cn: torch.Tensor,
+    mean_d: torch.Tensor,
+    min_d: torch.Tensor,
+    max_d: torch.Tensor
+) -> torch.Tensor:
+    """
+    per-atom scalar들을 NODE_STRUCT_DIM에 맞게 concat.
+
+    - configs.NODE_USE_CN / NODE_USE_LOCAL_DENSITY / NODE_USE_DIST_STATS
+      flag에 따라 포함할 피쳐가 결정됨.
+    - 현재는 raw 값 그대로 사용 (encoder가 scaling 학습).
+      필요하면 나중에 여기서 간단한 정규화 추가 가능.
+
+    입력:
+        cn, mean_d, min_d, max_d: (N,)
+
+    출력:
+        node_feats: (N, NODE_STRUCT_DIM)
+    """
+    # 모두 tensor로 통일
+    cn = _ensure_tensor_pos(cn).view(-1)
+    mean_d = _ensure_tensor_pos(mean_d).view(-1)
+    min_d = _ensure_tensor_pos(min_d).view(-1)
+    max_d = _ensure_tensor_pos(max_d).view(-1)
+
+    device = cn.device
+    N = cn.size(0)
+
+    feats: List[torch.Tensor] = []
+
+    if configs.NODE_USE_CN:
+        feats.append(cn.view(N, 1))  # (N, 1)
+
+    if configs.NODE_USE_LOCAL_DENSITY:
+        # mean_d가 0인 경우 density=0
+        eps = 1e-8
+        local_density = 1.0 / (mean_d + eps)
+        feats.append(local_density.view(N, 1))
+
+    if configs.NODE_USE_DIST_STATS:
+        feats.append(min_d.view(N, 1))
+        feats.append(mean_d.view(N, 1))
+        feats.append(max_d.view(N, 1))
+
+    if len(feats) == 0:
+        # 구조 피쳐 사용 안하면 0-dim 텐서 반환
+        return torch.zeros(N, 0, device=device)
+
+    node_feats = torch.cat(feats, dim=-1)  # (N, NODE_STRUCT_DIM 예상)
+    assert node_feats.shape[1] == configs.NODE_STRUCT_DIM, (
+        f"NODE_STRUCT_DIM mismatch: got {node_feats.shape[1]}, "
+        f"expected {configs.NODE_STRUCT_DIM}"
+    )
+    return node_feats
+
+
+def compute_rdf_descriptor(
+    pos: torch.Tensor,
+    num_bins: int = None,
+    r_max: float = None
+) -> torch.Tensor:
+    """
+    RDF (Radial Distribution Function) 기반 descriptor 생성.
+
+    - 모든 atom pair i<j 에 대해 거리 d_ij 계산
+    - [0, r_max] 구간을 num_bins로 등분한 histogram 생성
+    - histogram을 정규화 후 hist^2와 concat → (2 * num_bins,)
+
+    입력:
+        pos     : (N, 3) (tensor or numpy)
+        num_bins: 사용 bin 수 (None이면 configs.DESC_NUM_BINS_R)
+        r_max   : 최대 거리 (None이면 configs.DESC_R_MAX)
+
+    출력:
+        desc_rdf: (2 * num_bins,)
+    """
+    pos = _ensure_tensor_pos(pos)
+    device = pos.device
+
+    if num_bins is None:
+        num_bins = configs.DESC_NUM_BINS_R
+    if r_max is None:
+        r_max = configs.DESC_R_MAX
+
+    N = pos.size(0)
+    if N < 2:
+        hist = torch.zeros(num_bins, device=device)
+    else:
+        dists = torch.pdist(pos, p=2)  # (N*(N-1)/2,)
+        if dists.numel() == 0:
+            hist = torch.zeros(num_bins, device=device)
+        else:
+            hist = torch.histc(
+                dists,
+                bins=num_bins,
+                min=0.0,
+                max=r_max
+            )
+
+    # 정규화 (합 1) + 제곱 특징
+    if hist.sum() > 0:
+        hist = hist / hist.sum()
+
+    hist_sq = hist ** 2
+    desc = torch.cat([hist, hist_sq], dim=0)  # (2 * num_bins,)
+    return desc
+
+
+def compute_adf_descriptor(
+    pos: torch.Tensor,
+    num_bins: int = None,
+    radius: float = None
+) -> torch.Tensor:
+    """
+    ADF (Angular Distribution Function) 기반 descriptor.
+
+    - 각 center atom j에 대해, cutoff 이내 neighbor i, k 선택
+    - angle(i-j-k) ∈ [0, π] 계산
+    - angle들의 histogram + hist^2 → (2 * num_bins,)
+
+    입력:
+        pos     : (N, 3)
+        num_bins: angle bin 수 (None이면 configs.DESC_NUM_BINS_ANGLE)
+        radius  : neighbor cutoff (None이면 configs.NODE_RADIUS)
+
+    출력:
+        desc_adf: (2 * num_bins,)
+    """
+    pos = _ensure_tensor_pos(pos)
+    device = pos.device
+    N = pos.size(0)
+
+    if num_bins is None:
+        num_bins = configs.DESC_NUM_BINS_ANGLE
+    if radius is None:
+        radius = configs.NODE_RADIUS
+
+    if N < 3:
+        hist = torch.zeros(num_bins, device=device)
+        hist_sq = hist ** 2
+        return torch.cat([hist, hist_sq], dim=0)
+
+    # pairwise 거리 행렬
+    dists = torch.cdist(pos, pos, p=2)
+
+    angle_list: List[torch.Tensor] = []
+
+    for j in range(N):
+        # center j 기준 neighbor index
+        neigh_mask = (dists[j] > 0.0) & (dists[j] <= radius)
+        neigh_idx = torch.nonzero(neigh_mask, as_tuple=False).view(-1)
+
+        if neigh_idx.numel() < 2:
+            continue
+
+        # 이웃 쌍 (i, k) 순회 (작은 N이라 이중 루프 충분)
+        for a in range(neigh_idx.numel()):
+            i = neigh_idx[a]
+            v_ij = pos[i] - pos[j]
+            for b in range(a + 1, neigh_idx.numel()):
+                k = neigh_idx[b]
+                v_kj = pos[k] - pos[j]
+
+                # angle between v_ij and v_kj
+                dot = torch.dot(v_ij, v_kj)
+                norm_ij = torch.norm(v_ij) + 1e-8
+                norm_kj = torch.norm(v_kj) + 1e-8
+                cos_theta = (dot / (norm_ij * norm_kj)).clamp(-1.0, 1.0)
+                theta = torch.acos(cos_theta)  # [0, π]
+                angle_list.append(theta)
+
+    if len(angle_list) == 0:
+        hist = torch.zeros(num_bins, device=device)
+        hist_sq = hist ** 2
+        return torch.cat([hist, hist_sq], dim=0)
+
+    angles = torch.stack(angle_list)  # (M,)
+    hist = torch.histc(
+        angles,
+        bins=num_bins,
+        min=0.0,
+        max=math.pi
+    )
+
+    if hist.sum() > 0:
+        hist = hist / hist.sum()
+
+    hist_sq = hist ** 2
+    desc = torch.cat([hist, hist_sq], dim=0)  # (2 * num_bins,)
+    return desc
+
+
+def compute_shape_descriptor(pos: torch.Tensor) -> torch.Tensor:
+    """
+    Global shape descriptor (4D):
+        - inertia tensor eigenvalues (3)
+        - radius of gyration (1)
+
+    입력:
+        pos: (N, 3)
+
+    출력:
+        shape: (4,) tensor on pos.device
+    """
+    pos = _ensure_tensor_pos(pos)
+    device = pos.device
+    N = pos.size(0)
+
+    if N == 0:
+        return torch.zeros(4, device=device)
+
+    # center-of-mass 기준으로 이동
+    com = pos.mean(dim=0, keepdim=True)
+    r = pos - com  # (N, 3)
+
+    # radius of gyration
+    r2 = (r ** 2).sum(dim=1)  # (N,)
+    rg = torch.sqrt(torch.mean(r2) + 1e-12)
+
+    # inertia tensor: I = sum_i [ (r_i·r_i) I - r_i r_i^T ]
+    I = torch.zeros(3, 3, device=device)
+    eye3 = torch.eye(3, device=device)
+    for i in range(N):
+        ri = r[i].view(3, 1)
+        r2_i = (ri.view(-1) ** 2).sum()
+        I = I + (r2_i * eye3 - ri @ ri.t())
+
+    # eigenvalues (실수, 정렬)
+    evals = torch.linalg.eigvalsh(I)  # (3,)
+    evals, _ = torch.sort(evals.real)
+
+    shape = torch.cat([evals, rg.view(1)], dim=0)  # (4,)
+    return shape
+
+
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리
+여기서 무결성 체크 해주고 표로 고쳐야할 부분과 파일 정리

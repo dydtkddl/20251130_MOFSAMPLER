@@ -98,9 +98,1741 @@
 | 결과 파일 | - `results_random.csv`<br> - `results_latent.csv`<br> - `curve_mae.png` (optional, random vs latent)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | 로깅    | - 각 N, 각 전략에서 test 성능 로깅<br> - seed, hyperparam도 로그에 남기면 나중에 재현 쉬움                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
+
+
+
+
+
+
+지금 상태 기준으로 다섯 파일을 전부 한 세트로 본 뒤에,
+
+1. **명세와 얼마나 맞는지**
+2. **실제로 돌리면 터질 포인트 / 살짝 애매한 설계 포인트**
+
+를 나눠서 정리해볼게.
+
 ---
 
-* 먼저 `configs.py` + `utils.py`를 짧게 구현
-* 그다음 `models.py`에서 `ResidualMLP`부터 구현 (제일 쉬움)
-* `EquivGNNEncoder`/Decoder는 e3nn/pyg 템플릿 보면서 천천히
-* 마지막으로 `train_encoder_qm9.py` → `sampling_mlp_experiment.py` 순서로 가면 자연스러울 듯.
+## 1. 파일별 역할 vs 명세 매칭도
+
+| 파일                           | 명세대로 구현된 역할                                   | 상태                                 | 코멘트                                                                                                             |
+| ---------------------------- | --------------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `configs.py`                 | 공통 경로 + 하이퍼파라미터 SSoT                          | **대부분 OK (부분 미스매치)**               | 기본 구조는 좋음. 다만 `DESC_*`, `OUT_DIR`, `SEED`, `LATENT_NPZ_PATH` 같은 키가 실제 코드에서 기대되는 것과 완전히 정합되진 않음.                 |
+| `utils.py`                   | seed, metric, logger, split, plot             | **거의 OK (네이밍 미스)**                 | 기능은 다 들어있는데, `sampling_mlp_experiment.py`에서 부르는 함수 이름(`mae`, `rmse`)과 실제 정의(`mae_np`, `rmse_np`)가 안 맞아서 런타임 에러. |
+| `models.py`                  | EquivGNN encoder + decoder + Residual MLP     | **기능 OK, 설계/사이드이펙트 이슈**            | Residual MLP, encoder/decoder 골격은 명세에 맞게 잘 들어갔는데, `QM9`를 여기서 바로 로드하는 사이드 이펙트 + e3nn `Gate` 설정이 버전 의존성이 큼.       |
+| `train_encoder_qm9.py`       | QM9 구조-only self-supervised + latent/HOMO npz | **전체 플로우 OK (경로/설계 자잘한 부분 개선 여지)** | 학습 루프, descriptor 생성, latent 추출까지 플로우는 명세대로 잘 짜여 있음. split/경로/val 사용 방식에 약간 정리하면 좋은 지점 있음.                      |
+| `sampling_mlp_experiment.py` | latent 기반 random vs k-center 샘플링 + MLP 학습/평가  | **거의 OK (경로/metric/tqdm 개선 필요)**   | 실험 구조/로직은 명세대로 잘 짰고, Random vs k-center 비교도 맞음. 다만 npz 경로, metric 함수 이름, tqdm/logging 디테일 보완 필요.                |
+
+---
+
+## 2. 실제로 터질 수 있는 문제 / 명확한 버그
+
+### (1) `utils.mae`, `utils.rmse` 미정의
+
+| 항목    | 내용                                                                                                                    |
+| ----- | --------------------------------------------------------------------------------------------------------------------- |
+| 파일    | `utils.py` ↔ `sampling_mlp_experiment.py`                                                                             |
+| 문제    | `sampling_mlp_experiment.py`의 `eval_mlp()`에서 `utils.mae`, `utils.rmse`를 호출하는데, `utils.py`에는 `mae_np`, `rmse_np`만 존재함. |
+| 증상    | 실행 시: `AttributeError: module 'utils' has no attribute 'mae'`                                                         |
+| 해결 권장 | `utils.py`에 thin wrapper를 추가해서 두 이름을 모두 지원하는 게 제일 깔끔함.                                                                |
+
+**수정 예시 (utils.py에 추가):**
+
+```python
+# 기존 mae_np, rmse_np, r2_np 아래에 alias 추가
+
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for mae_np (편의용)."""
+    return mae_np(y_true, y_pred)
+
+
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for rmse_np (편의용)."""
+    return rmse_np(y_true, y_pred)
+
+
+def r2_numpy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for r2_np (이름 취향용)."""
+    return r2_np(y_true, y_pred)
+```
+
+이렇게 해두면, 나중에 어디서는 `mae_np`, 어디서는 `mae`를 써도 전부 동작함.
+
+---
+
+### (2) `models.py`에서 QM9을 바로 로드하는 사이드 이펙트
+
+| 항목    | 내용                                                                                                                                     |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| 파일    | `models.py`                                                                                                                            |
+| 문제    | `from torch_geometric.datasets import QM9` 뒤에 `dataset = QM9(root="./data_qm9")`가 있음.                                                  |
+| 증상    | ① `import models` 하는 순간 QM9 다운로드/로드가 강제 실행됨. ② 경로 하드코딩(`./data_qm9`)으로 `configs.DATA_ROOT`와도 불일치. ③ 실질적으로 `dataset` 변수는 어디에서도 사용되지 않음. |
+| 영향    | 불필요한 I/O + 코드 책임 분리 위배(모델 정의 파일이 데이터 로딩까지 해버림).                                                                                        |
+| 해결 권장 | `models.py`에서 QM9 관련 import/인스턴스는 **전부 삭제**하고, QM9는 오직 `train_encoder_qm9.py`에서만 로드.                                                   |
+
+**수정 예시 (models.py 상단):**
+
+```python
+# ⛔ 아래 두 줄 삭제
+# from torch_geometric.datasets import QM9 
+# dataset = QM9(root="./data_qm9")
+```
+
+---
+
+### (3) `latents_qm9.npz` 경로 불일치
+
+| 항목    | 내용                                                                                                                                              |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| 파일    | `train_encoder_qm9.py` ↔ `sampling_mlp_experiment.py`                                                                                           |
+| 문제    | `train_encoder_qm9.py`는 `args.out_dir` 아래에 `latents_qm9.npz`를 저장하고, `sampling_mlp_experiment.py`는 **현재 작업 디렉토리**에서 `"latents_qm9.npz"`를 바로 로드함. |
+| 증상    | `sampling_mlp_experiment.py`를 프로젝트 루트에서 돌리면: `FileNotFoundError: latents_qm9.npz` (실제 파일은 `./qm9_latent/latents_qm9.npz` 같은 곳에 있음).             |
+| 해결 권장 | 공통 config 키(`LATENT_NPZ_PATH`)를 `configs.py`에 두고 **저장/로딩 모두 동일 경로 사용**.                                                                         |
+
+**추천 수정 흐름:**
+
+1. **configs.py에 경로 상수 추가**
+
+```python
+# 경로 설정 아래쪽에 추가
+OUT_DIR = os.path.join(PROJECT_ROOT, "qm9_latent")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+LATENT_NPZ_PATH = os.path.join(OUT_DIR, "latents_qm9.npz")
+```
+
+2. **train_encoder_qm9.py에서 저장 경로를 configs 사용**
+
+```python
+# 기존:
+# npz_path = os.path.join(args.out_dir, "latents_qm9.npz")
+
+from configs import LATENT_NPZ_PATH
+
+npz_path = LATENT_NPZ_PATH
+np.savez_compressed(
+    npz_path,
+    z_all=z_all,
+    y_all=y_all,
+    idx_train=idx_train,
+    idx_val=idx_val,
+    idx_test=idx_test,
+)
+```
+
+3. **sampling_mlp_experiment.py에서 동일 경로로 로드**
+
+```python
+# 기존:
+# data = np.load("latents_qm9.npz", allow_pickle=True)
+
+from configs import LATENT_NPZ_PATH
+data = np.load(LATENT_NPZ_PATH, allow_pickle=True)
+```
+
+이렇게 하면 **항상 한 곳**을 바라보게 돼서, 디렉토리 바뀌어도 덜 헷갈림.
+
+---
+
+### (4) configs에 정의된/기대한 키들 간의 미묘한 어긋남
+
+| 항목    | 내용                                                                                                                                                                                                                                                             |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 파일    | `configs.py`, `train_encoder_qm9.py`                                                                                                                                                                                                                           |
+| 문제    | `train_encoder_qm9.py`는 `getattr(configs, "DESC_DIM", ...)`, `"DESC_NUM_BINS"`, `"DESC_R_MAX"`, `"SEED"`, `"QM9_HOMO_TARGET_INDEX"`, `"OUT_DIR"` 등을 기대하지만, 현재 `configs.py`에는 `RANDOM_SEED`만 있고 나머지는 직접 정의되어 있지 않음. (fallback 때문에 동작은 하지만, SSoT이라는 취지에서 약간 어긋남) |
+| 증상    | 동작은 함. 다만 config를 변경할 때 **어디를 바꿔야 하는지 직관성이 떨어짐**.                                                                                                                                                                                                              |
+| 해결 권장 | `configs.py`에 아래 값들을 명시적으로 추가해서 config를 한 곳에서만 관리.                                                                                                                                                                                                             |
+
+**추가 추천 내용 (configs.py):**
+
+```python
+# Seed
+SEED = 42         # RANDOM_SEED와 동일 의미
+RANDOM_SEED = SEED
+
+# 구조 descriptor 설정
+DESC_DIM = 128
+DESC_NUM_BINS = 64
+DESC_R_MAX = 5.0
+
+# QM9 HOMO target index (PyG QM9에서 기본 2번이 HOMO)
+QM9_HOMO_TARGET_INDEX = 2
+```
+
+이렇게 해두면, parser의 `getattr(..., default)` 부분도 실제 config 값과 딱 맞게 떨어짐.
+
+---
+
+## 3. 설계적으로 아쉬운 부분 / 개선권장 포인트
+
+### (5) EquivGNNEncoder에서 e3nn `Gate` 사용 부분 (버전 의존/복잡성)
+
+| 항목    | 내용                                                                                                                                                                                |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 파일    | `models.py` (`EquivMPBlock`)                                                                                                                                                      |
+| 현재 구현 | `Gate(scalars=scalars, act_scalars=[silu]*scalars.num_irreps, gate=(), act_gate=[], nonscalars=nonscalars)`                                                                       |
+| 문제    | e3nn `Gate`의 인자는 버전마다 조금씩 바뀌기도 했고, `gate=()`처럼 **gate irreps를 빈 튜플로 주는 형태**는 문서/예제에서 잘 안 쓰는 형태라 버전 호환성이 애매함. 실제로는 단순 scalar-act + non-scalar scaling이 목적이라면 `Gate` 없이도 충분히 구현 가능. |
+| 영향    | 설치된 e3nn 버전에 따라 **런타임 에러** 가능성 있음. 디버깅 난이도 ↑                                                                                                                                      |
+| 해결 권장 | 초기 프로토타입에서는 `Gate`를 과감히 빼고, `Linear + torch.relu` 정도의 간단한 equivariant block으로 구현하는 게 유지보수/안정성 면에서 좋음.                                                                             |
+
+**간단화 예시 (`EquivMPBlock.forward` 부분):**
+
+```python
+class EquivMPBlock(nn.Module):
+    def __init__(self, node_irreps, edge_irreps):
+        super().__init__()
+        self.node_irreps = node_irreps
+        self.edge_irreps = edge_irreps
+
+        self.tp = FullyConnectedTensorProduct(node_irreps, edge_irreps, node_irreps)
+        self.lin = Linear(node_irreps, node_irreps)
+
+    def forward(self, x, edge_index, sh):
+        src, dst = edge_index
+        m = self.tp(x[src], sh)              # (E, dim)
+        N = x.shape[0]
+        m_agg = x.new_zeros((N, self.node_irreps.dim))
+        m_agg.index_add_(0, dst, m)
+
+        h = self.lin(m_agg)                  # (N, dim)
+        h = torch.relu(h)                    # 간단 비선형
+        return x + h                         # residual
+```
+
+지금 목적은 **latent 공간 구조화 + 다음 단계 MLP 실험**이라, 여기서 아주 복잡한 게이트 구조를 쓰지 않아도 실험 설계에는 충분함.
+
+---
+
+### (6) configs.ENC_HIDDEN_IRREPS vs 모델 내부 설정 불일치
+
+| 항목    | 내용                                                                                                                                                                    |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 파일    | `configs.py`, `models.py`                                                                                                                                             |
+| 문제    | `configs.py`에는 `ENC_HIDDEN_IRREPS = "16x0e + 16x1o"`가 정의되어 있는데, `EquivGNNEncoder`는 `node_irreps_str="32x0e + 16x1o"`(하드코딩)으로 쓰고 있음. config를 바꾸더라도 encoder가 그걸 안 보는 셈. |
+| 영향    | SSoT 취지에서 벗어남. 하이퍼파라를 바꾸려면 코드와 config 두 군데를 건드려야 함.                                                                                                                   |
+| 해결 권장 | Encoder에서 `node_irreps_str: str = configs.ENC_HIDDEN_IRREPS`로 받도록 통일. config에서만 조절 가능하게.                                                                              |
+
+**수정 예시 (EquivGNNEncoder **init** 시그니처):**
+
+```python
+class EquivGNNEncoder(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int = configs.LATENT_DIM,
+        radius: float = 5.0,
+        max_atomic_num: int = 100,
+        num_layers: int = 3,
+        node_irreps_str: str = configs.ENC_HIDDEN_IRREPS,
+        lmax_edge: int = 1,
+    ):
+        ...
+        self.node_irreps = o3.Irreps(node_irreps_str)
+```
+
+---
+
+### (7) sampling MLP 학습에서 tqdm/logging 디테일
+
+| 항목    | 내용                                                                        |
+| ----- | ------------------------------------------------------------------------- |
+| 파일    | `sampling_mlp_experiment.py`                                              |
+| 현재    | `train_mlp()` 내부 epoch loop에는 tqdm이 없고, 50 epoch마다 logger로만 출력.           |
+| 명세/취향 | “순회하는 경우 tqdm으로 얼마나 진행되는지 보이게”라고 했으니, 여기 epoch 루프도 tqdm 한 줄 씌우면 사용감이 좋아짐. |
+| 해결 권장 | epoch loop를 tqdm으로 감싸고, desc에 샘플링 전략/샘플 수 정도를 넣어주면 직관적.                   |
+
+**수정 예시 (train_mlp):**
+
+```python
+from tqdm import tqdm
+
+def train_mlp(z_train, y_train, z_val, y_val, logger, desc="MLP"):
+    ...
+    for epoch in tqdm(range(configs.MLP_EPOCHS), desc=desc, ncols=100):
+        model.train()
+        ...
+        if epoch % 50 == 0:
+            ...
+            logger.info(f"[{desc}] Epoch {epoch}  TrainLoss={loss.item():.6f}  ValLoss={val_loss:.6f}")
+```
+
+그리고 `main()`에서 호출할 때:
+
+```python
+model_r = train_mlp(
+    z_train[rand_idx],
+    y_train[rand_idx],
+    z_val, y_val,
+    logger,
+    desc=f"Random N={N}"
+)
+```
+
+---
+
+### (8) MLP 학습에서 batch size / weight decay config 미사용
+
+| 항목    | 내용                                                                                                                                                   |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 파일    | `sampling_mlp_experiment.py`, `configs.py`                                                                                                           |
+| 현재    | `configs.MLP_BATCH_SIZE`, `MLP_WEIGHT_DECAY`가 정의되어 있지만, `train_mlp`에서는 한 번에 전체 subset을 통째로 학습하고 있음(배치 없음).                                           |
+| 영향    | 지금 N 리스트가 최대 2000이라 크게 문제는 없지만, batch 기반 학습으로 바꾸면 config 사용성이 더 일관됨. 성능엔 큰 영향 X, 관리 측면 개선.                                                           |
+| 해결 권장 | 나중에 N이 더 커질 걸 고려하면, 간단한 `TensorDataset + DataLoader`로 바꿔서 `MLP_BATCH_SIZE`, `MLP_WEIGHT_DECAY`를 실제로 사용하도록 리팩토링하는 게 좋음. (지금 당장은 필수는 아님, “개선 포인트” 정도.) |
+
+---
+
+### (9) self-supervised encoder 학습에서 train+val을 한꺼번에 사용하는 설계
+
+| 항목    | 내용                                                                                                                                                       |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 파일    | `train_encoder_qm9.py`                                                                                                                                   |
+| 현재    | `idx_enc = np.concatenate([idx_train, idx_val])`로 encoder 학습 subset을 **train+val** 모두로 구성하고, validation은 `idx_val`만으로 계산. 즉, val 샘플이 학습에도 사용되고, 검증에도 쓰임. |
+| 장단점   | self-supervised라서 **test만 확실히 분리**해두면 큰 문제는 없지만, “val의 의미”가 희미해짐. encoder capacity/overfit 정도를 보고 싶다면 val을 학습에서 완전히 분리하는 편이 해석하기 더 깔끔함.                  |
+| 해결 권장 | encoder를 train만으로 학습하고, val은 loss 모니터링 용으로만 쓰는 구성으로 변경하는 걸 추천.                                                                                           |
+
+**수정 예시:**
+
+```python
+# enc_subset = Subset(dataset, idx_enc)
+enc_subset = Subset(dataset, idx_train)  # 학습은 train만 사용
+
+val_subset = Subset(dataset, idx_val) if len(idx_val) > 0 else None
+```
+
+---
+
+## 4. 정리
+
+요약하면:
+
+* **바로 터지는 실질 버그:**
+
+  * `utils.mae / rmse` 미정의 → alias 추가 필요
+  * `models.py`에서 QM9를 import와 동시에 인스턴스화 → 꼭 제거
+  * `latents_qm9.npz` 저장/로딩 경로를 `configs.LATENT_NPZ_PATH`로 통일
+
+* **SSoT / 설계 측면에서 다듬으면 좋은 부분:**
+
+  * `configs.py`에 `DESC_*`, `SEED`, `QM9_HOMO_TARGET_INDEX`, `OUT_DIR`, `LATENT_NPZ_PATH` 명시
+  * `EquivGNNEncoder` irreps 설정을 configs와 통일
+  * e3nn `Gate`는 일단 덜 공격적인 형태(혹은 제거)로 단순화
+
+* **사용감/실험 관리 측면 개선 포인트:**
+
+  * `sampling_mlp_experiment.py`의 MLP 학습에 tqdm desc/TAG 더 붙이기
+  * MLP에 batch size/weight decay config 실제 반영
+  * self-supervised encoder에서 val split을 학습에서 분리할지 여부 정리
+
+이 정도만 손보면,
+**“QM9 → EquivGNN latent → Random vs k-center 샘플링 → Residual MLP 실험”**
+파이프라인이 꽤 안정적으로 돌아갈 거야.
+
+원하면 다음 단계로, 내가 위에서 말한 수정 사항까지 반영한 **패치 버전 코드 블록**을 파일별로 다시 쭉 정리해서 내줄 수도 있어.
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+configs.py
+- 공통 하이퍼파라미터 및 경로 설정 (Single Source of Truth)
+- 다른 스크립트에서 import 해서 사용
+"""
+
+import os
+
+# ==============================
+# 프로젝트/경로 설정
+# ==============================
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# 원본/전처리 데이터 루트 (QM9 등)
+DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
+os.makedirs(DATA_ROOT, exist_ok=True)
+
+# 체크포인트(encoder/decoder/MLP 등) 저장 경로
+MODEL_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# 결과(npz, csv, plots) 저장 경로
+RESULT_DIR = os.path.join(PROJECT_ROOT, "results")
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+# QM9 latent 전용 출력 디렉토리 (encoder 학습 + npz 저장)
+OUT_DIR = os.path.join(PROJECT_ROOT, "qm9_latent")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# latents_qm9.npz 공통 경로 (train_encoder / sampling 실험에서 같이 사용)
+LATENT_NPZ_PATH = os.path.join(OUT_DIR, "latents_qm9.npz")
+
+# ==============================
+# Seed / Random 관련
+# ==============================
+SEED = 42
+RANDOM_SEED = SEED  # alias
+
+# ==============================
+# Encoder (EquivGNN) 설정
+# ==============================
+LATENT_DIM = 128
+
+# EquivGNN 내부 node feature irreps (encoder에서 기본값으로 사용)
+ENC_HIDDEN_IRREPS = "32x0e + 16x1o"
+
+ENC_LR = 1e-3
+ENC_BATCH_SIZE = 64
+ENC_EPOCHS = 100
+ENC_WEIGHT_DECAY = 1e-5
+
+# ==============================
+# Decoder (invariant head) 설정
+# ==============================
+DEC_HIDDEN_DIM = 256
+DEC_LR = ENC_LR         # encoder와 동일하게 두어도 OK
+DEC_WEIGHT_DECAY = ENC_WEIGHT_DECAY
+
+# ==============================
+# 구조 descriptor 설정
+#  - train_encoder_qm9.py 의 build_structural_descriptor 와 동일하게 사용
+# ==============================
+DESC_DIM = 128          # 최종 descriptor dimension
+DESC_NUM_BINS = 64      # pairwise distance histogram bin 수
+DESC_R_MAX = 5.0        # histogram 상한 거리
+
+# ==============================
+# QM9 target 설정 (HOMO index)
+# ==============================
+# PyG QM9 dataset 기준: y[:, 2]가 HOMO (기본)
+QM9_HOMO_TARGET_INDEX = 2
+
+# ==============================
+# Residual MLP (HOMO 예측용) 설정
+# ==============================
+MLP_HIDDEN_DIM = 256
+MLP_LAYERS = 3
+MLP_LR = 1e-3
+MLP_BATCH_SIZE = 256
+MLP_EPOCHS = 200
+MLP_WEIGHT_DECAY = 0.0
+
+# ==============================
+# 데이터 Split & 샘플링 설정
+# ==============================
+TRAIN_VAL_TEST_SPLIT = (0.8, 0.1, 0.1)  # 전체 QM9 기준 비율
+
+# 샘플링 실험에서 사용할 train size 리스트
+SAMPLING_NS = [10, 20, 50, 100, 200, 500, 1000, 2000]
+
+# ==============================
+# DataLoader / Logging 옵션
+# ==============================
+NUM_WORKERS = 4          # DataLoader num_workers
+PIN_MEMORY = True        # GPU 사용 시 DataLoader 옵션
+
+# 기본 로그 레벨 ("DEBUG", "INFO", "WARNING" ...)
+LOG_LEVEL = "INFO"
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+models.py
+- Equivariant GNN Encoder (QM9 구조 → latent z)
+- Invariant Decoder (latent → 구조 descriptor)
+- Residual MLP (latent → HOMO 예측)
+
+설계 포인트
+----------
+- Encoder:
+    * e3nn + PyG radius_graph 사용
+    * node irreps: configs.ENC_HIDDEN_IRREPS
+    * 메시지패싱 블록은 Gate 없이 TP + Linear + ReLU + residual 구조 (버전 의존성 최소화)
+- Decoder:
+    * 단순 MLP로 invariant descriptor 재구성 (DESC_DIM과 호환)
+- ResidualMLP:
+    * latent_dim → hidden_dim → 3개 residual block → scalar 출력
+"""
+
+from typing import Optional
+
+import torch
+import torch.nn as nn
+from torch_geometric.nn import radius_graph
+
+from e3nn import o3
+from e3nn.o3 import FullyConnectedTensorProduct, Linear
+
+import configs
+
+
+# ============================================================
+# 1. Residual Block & Residual MLP (HOMO 예측용)
+# ============================================================
+
+class ResidualBlock(nn.Module):
+    """단일 Residual MLP 블록: Linear -> ReLU -> skip connection."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.fc = nn.Linear(dim, dim)
+        self.act = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, dim)
+        out = self.fc(x)
+        out = self.act(out)
+        return x + out
+
+
+class ResidualMLP(nn.Module):
+    """
+    구조 latent z를 입력으로 HOMO를 예측하는 Residual MLP.
+    - 입력: (batch, latent_dim)
+    - 출력: (batch,) HOMO 값
+    """
+
+    def __init__(
+        self,
+        in_dim: int = configs.LATENT_DIM,
+        hidden_dim: int = configs.MLP_HIDDEN_DIM,
+        num_layers: int = configs.MLP_LAYERS,
+    ):
+        super().__init__()
+
+        self.in_proj = nn.Linear(in_dim, hidden_dim)
+        self.blocks = nn.ModuleList(
+            [ResidualBlock(hidden_dim) for _ in range(num_layers)]
+        )
+        self.out_proj = nn.Linear(hidden_dim, 1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z: (batch, latent_dim)
+        return: (batch,)
+        """
+        h = self.in_proj(z)
+        h = torch.relu(h)
+
+        for block in self.blocks:
+            h = block(h)
+
+        out = self.out_proj(h)  # (batch, 1)
+        return out.squeeze(-1)
+
+
+# ============================================================
+# 2. Equivariant Message Passing Block
+#   - E(3) equivariant TP + Linear + ReLU + Residual
+# ============================================================
+
+class EquivMPBlock(nn.Module):
+    """
+    단일 equivariant message passing 블록.
+    - node_irreps -> node_irreps (residual)
+    - edge_irreps: spherical harmonics(l<=1 등)
+    """
+
+    def __init__(
+        self,
+        node_irreps: o3.Irreps,
+        edge_irreps: o3.Irreps,
+    ):
+        super().__init__()
+        self.node_irreps = node_irreps
+        self.edge_irreps = edge_irreps
+
+        # 메시지 계산용 TensorProduct: h_i, Y_ij -> m_ij
+        self.tp = FullyConnectedTensorProduct(
+            node_irreps, edge_irreps, node_irreps
+        )
+
+        # 메시지 aggregation 이후 node-wise 업데이트용 선형 변환
+        self.lin = Linear(node_irreps, node_irreps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        sh: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        x: (N, node_irreps.dim)
+        edge_index: (2, E)
+        sh: (E, edge_irreps.dim)
+        """
+        src, dst = edge_index
+
+        # 메시지: m_ij = TP(x_i, Y_ij)
+        m = self.tp(x[src], sh)  # (E, node_irreps.dim)
+
+        # 수신 노드 dst에 sum aggregation
+        N = x.shape[0]
+        m_agg = x.new_zeros((N, self.node_irreps.dim))
+        m_agg.index_add_(0, dst, m)
+
+        # 선형 + ReLU
+        h = self.lin(m_agg)
+        h = torch.relu(h)
+
+        # Residual
+        return x + h
+
+
+# ============================================================
+# 3. Equivariant GNN Encoder (QM9 구조 → latent z)
+# ============================================================
+
+class EquivGNNEncoder(nn.Module):
+    """
+    QM9 분자 구조용 E(3)-equivariant encoder.
+
+    입력:
+        z: (N,) long, atomic numbers
+        pos: (N, 3) float, 3D coordinates
+        batch: (N,) long, PyG graph index (0 ~ B-1)
+
+    출력:
+        z_graph: (B, latent_dim) graph-level latent
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = configs.LATENT_DIM,
+        radius: float = 5.0,
+        max_atomic_num: int = 100,
+        num_layers: int = 3,
+        node_irreps_str: str = configs.ENC_HIDDEN_IRREPS,
+        lmax_edge: int = 1,
+    ):
+        super().__init__()
+        self.radius = radius
+        self.latent_dim = latent_dim
+        self.num_layers = num_layers
+
+        # ----------------------------------------------------
+        # irreps 설정
+        # ----------------------------------------------------
+        self.node_irreps = o3.Irreps(node_irreps_str)
+        self.edge_irreps = o3.Irreps.spherical_harmonics(lmax=lmax_edge)
+
+        # ----------------------------------------------------
+        # 원자 타입 embedding (scalar 0e) -> node_irreps로 사상
+        # ----------------------------------------------------
+        # (간단히 0e scalar만 사용 후 Linear로 node_irreps로 투사)
+        scalars_dim = 32
+        self.atom_emb = nn.Embedding(max_atomic_num, scalars_dim)
+        self.scalar_irreps = o3.Irreps(f"{scalars_dim}x0e")
+        self.scalar2node = Linear(self.scalar_irreps, self.node_irreps)
+
+        # ----------------------------------------------------
+        # Equivariant MP blocks (multi-layer + residual)
+        # ----------------------------------------------------
+        self.layers = nn.ModuleList([
+            EquivMPBlock(self.node_irreps, self.edge_irreps)
+            for _ in range(num_layers)
+        ])
+
+        # ----------------------------------------------------
+        # graph-level pooling 후 latent로 MLP 투사
+        # ----------------------------------------------------
+        self.readout = nn.Sequential(
+            nn.Linear(self.node_irreps.dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim),
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        pos: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        z: (N,) long
+        pos: (N, 3)
+        batch: (N,)
+        """
+        # 1) atomic number → scalar embedding
+        x_scalar = self.atom_emb(z)  # (N, scalars_dim)
+
+        # scalar irreps 텐서로 보고 node irreps로 사상
+        # e3nn Linear는 내부적으로 irreps 차원에 맞게 처리
+        x = self.scalar2node(x_scalar)  # (N, node_irreps.dim)
+
+        # 2) radius graph (한 번만 계산 후 모든 layer에서 공유)
+        edge_index = radius_graph(pos, r=self.radius, batch=batch)
+        src, dst = edge_index
+
+        # 3) edge 방향 기반 spherical harmonics (한 번 계산)
+        rij = pos[dst] - pos[src]  # (E, 3)
+        sh = o3.spherical_harmonics(
+            self.edge_irreps,
+            rij,
+            normalize=True,
+            normalization='component'
+        )  # (E, edge_irreps.dim)
+
+        # 4) multi-layer equivariant message passing
+        for layer in self.layers:
+            x = layer(x, edge_index, sh)
+
+        # 5) batch-wise pooling (sum)
+        B = int(batch.max().item()) + 1
+        hg = x.new_zeros((B, self.node_irreps.dim))
+        hg.index_add_(0, batch, x)
+
+        # 6) latent projection
+        z_graph = self.readout(hg)  # (B, latent_dim)
+        return z_graph
+
+
+# ============================================================
+# 4. Invariant Decoder (latent → 구조 descriptor 재구성)
+# ============================================================
+
+class EquivDecoder(nn.Module):
+    """
+    구조-only self-supervised 학습용 invariant decoder.
+
+    - 입력: graph-level latent (B, latent_dim)
+    - 출력: 재구성 타깃 descriptor (B, desc_dim)
+
+    desc_dim은 train_encoder_qm9.py에서 정의하는
+    구조 descriptor (예: distance histogram) dimension과 맞춰야 한다.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = configs.LATENT_DIM,
+        desc_dim: int = configs.DESC_DIM,
+        hidden_dim: int = configs.DEC_HIDDEN_DIM,
+        num_layers: int = 3,
+    ):
+        super().__init__()
+        self.desc_dim = desc_dim
+
+        layers = []
+        in_dim = latent_dim
+        for _ in range(num_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, desc_dim))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z_graph: torch.Tensor) -> torch.Tensor:
+        """
+        z_graph: (B, latent_dim)
+        return: (B, desc_dim)
+        """
+        return self.net(z_graph)
+
+
+__all__ = [
+    "ResidualBlock",
+    "ResidualMLP",
+    "EquivMPBlock",
+    "EquivGNNEncoder",
+    "EquivDecoder",
+]
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+sampling_mlp_experiment.py
+- QM9 latent 공간에서 샘플링 전략 비교
+    * Random sampling
+    * Latent k-center (farthest-first) sampling
+- 각 N (configs.SAMPLING_NS)에 대해:
+    * 선택된 subset으로 ResidualMLP 학습
+    * 고정 test set에서 MAE / RMSE / R2 평가
+- 결과:
+    * results_random.csv
+    * results_kcenter.csv
+    * curve_mae.png (N vs MAE, random vs kcenter)
+"""
+
+import os
+import argparse
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+import configs
+import utils
+from models import ResidualMLP
+
+
+# ============================================================
+# k-center greedy (farthest-first) 샘플링
+# ============================================================
+
+def kcenter_greedy(
+    X: np.ndarray,
+    n_samples: int,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Latent 공간에서 farthest-first 방식의 k-center greedy.
+
+    X: (N, d) latent vector 배열
+    n_samples: 선택할 샘플 수
+    return: 선택된 index 배열 (shape: (n_samples,))
+    """
+    N = X.shape[0]
+    assert n_samples <= N, "n_samples must be <= N"
+
+    rng = np.random.RandomState(seed)
+
+    # 초기 center 랜덤 선택
+    first_idx = rng.randint(0, N)
+    centers = [first_idx]
+
+    # 각 포인트가 가장 가까운 center까지의 거리 (초기에는 ∞)
+    dist = np.full(N, np.inf, dtype=np.float64)
+
+    # 첫 center에 대해 거리 갱신
+    diff = X - X[first_idx]
+    dist = np.minimum(dist, np.linalg.norm(diff, axis=1))
+
+    for _ in tqdm(range(1, n_samples), desc="k-center greedy", ncols=100):
+        # 현재 center들과 가장 먼 포인트 선택
+        next_idx = int(np.argmax(dist))
+        centers.append(next_idx)
+
+        # 새 center 기준 거리 갱신
+        diff = X - X[next_idx]
+        dist = np.minimum(dist, np.linalg.norm(diff, axis=1))
+
+    return np.array(centers, dtype=np.int64)
+
+
+# ============================================================
+# Numpy → Torch Dataset
+# ============================================================
+
+class NumpyDataset(Dataset):
+    """단순 (X, y) numpy array용 Dataset."""
+
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        assert X.shape[0] == y.shape[0]
+        self.X = X.astype(np.float32)
+        self.y = y.astype(np.float32)
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        return (
+            torch.from_numpy(self.X[idx]),
+            torch.tensor(self.y[idx]),
+        )
+
+
+# ============================================================
+# ResidualMLP 학습 루프
+# ============================================================
+
+def train_mlp(
+    z_train: np.ndarray,
+    y_train: np.ndarray,
+    z_val: np.ndarray,
+    y_val: np.ndarray,
+    logger,
+    desc: str = "MLP",
+) -> ResidualMLP:
+    """
+    선택된 subset으로 ResidualMLP를 한 번 학습하고, val에서 best 모델 반환.
+    """
+    device = utils.get_device()
+    utils.set_seed(configs.SEED)  # 내부 seed 재고정 (재현성)
+
+    input_dim = z_train.shape[1]
+    model = ResidualMLP(in_dim=input_dim).to(device)
+
+    train_dataset = NumpyDataset(z_train, y_train)
+    val_dataset = NumpyDataset(z_val, y_val)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=configs.MLP_BATCH_SIZE,
+        shuffle=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=configs.MLP_BATCH_SIZE,
+        shuffle=False
+    )
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=configs.MLP_LR,
+        weight_decay=configs.MLP_WEIGHT_DECAY
+    )
+
+    best_val_loss = float("inf")
+    best_state_dict = None
+
+    for epoch in tqdm(range(1, configs.MLP_EPOCHS + 1), desc=desc, ncols=100):
+        # -----------------------------
+        # Train
+        # -----------------------------
+        model.train()
+        train_loss_sum = 0.0
+        n_train_batches = 0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            optimizer.zero_grad()
+            preds = model(xb)
+            loss = criterion(preds, yb)
+            loss.backward()
+            optimizer.step()
+
+            train_loss_sum += loss.item()
+            n_train_batches += 1
+
+        train_loss = train_loss_sum / max(1, n_train_batches)
+
+        # -----------------------------
+        # Validation
+        # -----------------------------
+        model.eval()
+        val_loss_sum = 0.0
+        n_val_batches = 0
+
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                preds = model(xb)
+                loss = criterion(preds, yb)
+
+                val_loss_sum += loss.item()
+                n_val_batches += 1
+
+        val_loss = val_loss_sum / max(1, n_val_batches)
+
+        if epoch % 50 == 0 or epoch == 1 or epoch == configs.MLP_EPOCHS:
+            logger.info(
+                f"[{desc}] Epoch {epoch}/{configs.MLP_EPOCHS} "
+                f"TrainLoss={train_loss:.6f}  ValLoss={val_loss:.6f}"
+            )
+
+        # -----------------------------
+        # Best 모델 갱신
+        # -----------------------------
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+
+    logger.info(f"[{desc}] Best ValLoss={best_val_loss:.6f}")
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    return model
+
+
+# ============================================================
+# Evaluation
+# ============================================================
+
+@torch.no_grad()
+def eval_mlp(
+    model: ResidualMLP,
+    z_test: np.ndarray,
+    y_test: np.ndarray,
+) -> tuple:
+    device = utils.get_device()
+    model = model.to(device)
+    model.eval()
+
+    X_test = torch.from_numpy(z_test.astype(np.float32)).to(device)
+    y_true = torch.from_numpy(y_test.astype(np.float32)).to(device)
+
+    preds = model(X_test)
+    preds_np = preds.cpu().numpy()
+    y_true_np = y_true.cpu().numpy()
+
+    mae = utils.mae(y_true_np, preds_np)
+    rmse = utils.rmse(y_true_np, preds_np)
+    r2 = utils.r2_numpy(y_true_np, preds_np)
+
+    return mae, rmse, r2
+
+
+# ============================================================
+# 메인
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sampling experiment on QM9 latents (Random vs k-center)"
+    )
+    parser.add_argument("--seed", type=int, default=configs.RANDOM_SEED)
+    parser.add_argument(
+        "--npz_path",
+        type=str,
+        default=configs.LATENT_NPZ_PATH,
+        help="Path to latents_qm9.npz"
+    )
+    parser.add_argument(
+        "--no_plot",
+        action="store_true",
+        help="Disables MAE curve plotting"
+    )
+    args = parser.parse_args()
+
+    # Seed & Logger
+    utils.set_seed(args.seed)
+    log_file = os.path.join(configs.RESULT_DIR, "sampling_mlp_experiment.log")
+    logger = utils.get_logger("sampling_mlp", log_file=log_file)
+
+    logger.info("===== Sampling MLP Experiment (Random vs k-center) =====")
+    logger.info(f"NPZ path: {args.npz_path}")
+
+    # --------------------------------------------------------
+    # Latent npz 로드
+    # --------------------------------------------------------
+    data = np.load(args.npz_path, allow_pickle=True)
+    z_all: np.ndarray = data["z_all"]
+    y_all: np.ndarray = data["y_all"]
+    idx_train: np.ndarray = data["idx_train"]
+    idx_val: np.ndarray = data["idx_val"]
+    idx_test: np.ndarray = data["idx_test"]
+
+    logger.info(
+        f"z_all shape: {z_all.shape}, y_all shape: {y_all.shape} "
+        f"(train/val/test = {len(idx_train)}/{len(idx_val)}/{len(idx_test)})"
+    )
+
+    # train/val/test 분할
+    z_train = z_all[idx_train]
+    y_train = y_all[idx_train]
+
+    z_val = z_all[idx_val] if len(idx_val) > 0 else z_train
+    y_val = y_all[idx_val] if len(idx_val) > 0 else y_train
+
+    z_test = z_all[idx_test]
+    y_test = y_all[idx_test]
+
+    # 사용할 N 리스트 (train size 보다 큰 값은 제거)
+    Ns = [n for n in configs.SAMPLING_NS if n <= len(z_train)]
+    logger.info(f"Sampling Ns: {Ns}")
+
+    # --------------------------------------------------------
+    # k-center index 미리 계산 (가장 큰 N에 대해 한 번만)
+    # --------------------------------------------------------
+    max_N = max(Ns)
+    logger.info(f"Precomputing k-center indices for max N={max_N}...")
+    kcenter_indices_full = kcenter_greedy(
+        z_train,
+        n_samples=max_N,
+        seed=args.seed + 1
+    )
+
+    # --------------------------------------------------------
+    # Random / k-center 에 대해 실험
+    # --------------------------------------------------------
+    results_random = {
+        "N": [],
+        "MAE": [],
+        "RMSE": [],
+        "R2": [],
+    }
+    results_kcenter = {
+        "N": [],
+        "MAE": [],
+        "RMSE": [],
+        "R2": [],
+    }
+
+    rng = np.random.RandomState(args.seed + 123)
+
+    # ---------------- Random ----------------
+    logger.info("### Random sampling experiments ###")
+    for N in Ns:
+        logger.info(f"[Random] N = {N}")
+
+        rand_idx = rng.choice(len(z_train), size=N, replace=False)
+        z_sub = z_train[rand_idx]
+        y_sub = y_train[rand_idx]
+
+        model_r = train_mlp(
+            z_sub, y_sub,
+            z_val, y_val,
+            logger,
+            desc=f"Random N={N}"
+        )
+
+        mae_r, rmse_r, r2_r = eval_mlp(model_r, z_test, y_test)
+        logger.info(
+            f"[Random] N={N}  "
+            f"MAE={mae_r:.5f}, RMSE={rmse_r:.5f}, R2={r2_r:.5f}"
+        )
+
+        results_random["N"].append(N)
+        results_random["MAE"].append(mae_r)
+        results_random["RMSE"].append(rmse_r)
+        results_random["R2"].append(r2_r)
+
+    # ---------------- k-center ----------------
+    logger.info("### k-center sampling experiments ###")
+    for N in Ns:
+        logger.info(f"[k-center] N = {N}")
+
+        kc_idx = kcenter_indices_full[:N]
+        z_sub = z_train[kc_idx]
+        y_sub = y_train[kc_idx]
+
+        model_k = train_mlp(
+            z_sub, y_sub,
+            z_val, y_val,
+            logger,
+            desc=f"k-center N={N}"
+        )
+
+        mae_k, rmse_k, r2_k = eval_mlp(model_k, z_test, y_test)
+        logger.info(
+            f"[k-center] N={N}  "
+            f"MAE={mae_k:.5f}, RMSE={rmse_k:.5f}, R2={r2_k:.5f}"
+        )
+
+        results_kcenter["N"].append(N)
+        results_kcenter["MAE"].append(mae_k)
+        results_kcenter["RMSE"].append(rmse_k)
+        results_kcenter["R2"].append(r2_k)
+
+    # --------------------------------------------------------
+    # 결과 저장 (CSV + MAE 곡선)
+    # --------------------------------------------------------
+    os.makedirs(configs.RESULT_DIR, exist_ok=True)
+
+    df_random = pd.DataFrame(results_random)
+    df_kcenter = pd.DataFrame(results_kcenter)
+
+    random_csv = os.path.join(configs.RESULT_DIR, "results_random.csv")
+    kcenter_csv = os.path.join(configs.RESULT_DIR, "results_kcenter.csv")
+
+    df_random.to_csv(random_csv, index=False)
+    df_kcenter.to_csv(kcenter_csv, index=False)
+
+    logger.info(f"Saved random results to: {random_csv}")
+    logger.info(f"Saved k-center results to: {kcenter_csv}")
+
+    # MAE 곡선 플롯
+    if not args.no_plot:
+        mae_dict = {
+            "random": results_random["MAE"],
+            "k-center": results_kcenter["MAE"],
+        }
+        mae_png = os.path.join(configs.RESULT_DIR, "curve_mae.png")
+        utils.save_learning_curve(
+            x_values=Ns,
+            y_dict=mae_dict,
+            out_png=mae_png,
+            xlabel="# train samples",
+            ylabel="MAE (HOMO)",
+            title="Random vs k-center sampling (QM9 latents)",
+        )
+        logger.info(f"Saved MAE curve to: {mae_png}")
+
+    logger.info("Sampling MLP experiment finished. ✅")
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+train_encoder_qm9.py
+- QM9 구조-only self-supervised 학습
+- EquivGNNEncoder + Invariant Decoder 로 구조 descriptor 재구성
+- 학습 완료 후 전체 QM9에 대한 latent z 및 HOMO y를 npz로 저장
+
+출력:
+- encoder/decoder 체크포인트: checkpoints/encoder_struct.pt, decoder_struct.pt
+- latent npz: configs.LATENT_NPZ_PATH (latents_qm9.npz)
+    * z_all: (N_mol, LATENT_DIM)
+    * y_all: (N_mol,)
+    * idx_train, idx_val, idx_test: split index
+"""
+
+import os
+import argparse
+from typing import Tuple
+
+import numpy as np
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Subset
+
+from torch_geometric.datasets import QM9
+from torch_geometric.loader import DataLoader as PyGDataLoader
+
+import configs
+import utils
+from models import EquivGNNEncoder, EquivDecoder
+
+
+# ============================================================
+# 구조 descriptor: pairwise distance histogram 기반
+# ============================================================
+
+def build_structural_descriptor(
+    pos: torch.Tensor,
+    num_bins: int,
+    r_max: float,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """
+    단일 분자에 대한 구조 descriptor 생성.
+
+    아이디어:
+    - 모든 atom pair i<j 에 대해 거리 d_ij 계산
+    - [0, r_max] 구간을 num_bins로 등분한 histogram 생성
+    - histogram 값을 정규화 후, hist^2와 concat → 총 2 * num_bins 차원
+    - configs.DESC_DIM == 2 * num_bins 인지 체크 (불일치면 assert)
+
+    pos: (N, 3), float
+    return: (DESC_DIM,) float
+    """
+    num_bins_cfg = configs.DESC_NUM_BINS
+    desc_dim_cfg = configs.DESC_DIM
+    assert desc_dim_cfg == 2 * num_bins_cfg, (
+        f"DESC_DIM({desc_dim_cfg}) must be 2 * DESC_NUM_BINS({num_bins_cfg})"
+    )
+
+    pos = pos.to(device=device, dtype=torch.float32)
+    N = pos.size(0)
+
+    if N < 2:
+        # atom이 1개인 edge case → 0벡터 반환
+        hist = torch.zeros(num_bins, device=device)
+    else:
+        # (N,3) → pairwise 거리 (N*(N-1)/2,)
+        # torch.pdist는 CPU에서 동작하므로 device 강제시 CPU로 보내도 됨.
+        dists = torch.pdist(pos, p=2)
+
+        # [0, r_max] 구간에서 histogram
+        # torch.histc는 [min, max] 포함, bins 개
+        hist = torch.histc(
+            dists,
+            bins=num_bins,
+            min=0.0,
+            max=r_max
+        )
+
+    # 정규화 (합 1) + 제곱 특징
+    if hist.sum() > 0:
+        hist = hist / hist.sum()
+
+    hist_sq = hist ** 2
+    desc = torch.cat([hist, hist_sq], dim=0)  # (2 * num_bins,)
+    return desc
+
+
+# ============================================================
+# 학습 루프 (encoder + decoder)
+# ============================================================
+
+def train_one_epoch(
+    encoder: EquivGNNEncoder,
+    decoder: EquivDecoder,
+    loader: PyGDataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    criterion: nn.Module,
+) -> float:
+    encoder.train()
+    decoder.train()
+
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in tqdm(loader, desc="Train encoder", ncols=100):
+        batch = batch.to(device)
+        optimizer.zero_grad()
+
+        # 구조 latent
+        z_graph = encoder(batch.z, batch.pos, batch.batch)
+        # 구조 descriptor target (graph-wise)
+        target_desc = batch.struct_desc.to(device)
+
+        pred_desc = decoder(z_graph)
+
+        loss = criterion(pred_desc, target_desc)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / max(1, n_batches)
+
+
+@torch.no_grad()
+def eval_one_epoch(
+    encoder: EquivGNNEncoder,
+    decoder: EquivDecoder,
+    loader: PyGDataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+) -> float:
+    encoder.eval()
+    decoder.eval()
+
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in tqdm(loader, desc="Val encoder", ncols=100):
+        batch = batch.to(device)
+
+        z_graph = encoder(batch.z, batch.pos, batch.batch)
+        target_desc = batch.struct_desc.to(device)
+        pred_desc = decoder(z_graph)
+
+        loss = criterion(pred_desc, target_desc)
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / max(1, n_batches)
+
+
+# ============================================================
+# 전체 latent 추출
+# ============================================================
+
+@torch.no_grad()
+def extract_latents(
+    encoder: EquivGNNEncoder,
+    loader: PyGDataLoader,
+    device: torch.device
+) -> np.ndarray:
+    encoder.eval()
+
+    all_latents = []
+
+    for batch in tqdm(loader, desc="Extract latents", ncols=100):
+        batch = batch.to(device)
+        z_graph = encoder(batch.z, batch.pos, batch.batch)  # (B, latent_dim)
+        all_latents.append(z_graph.cpu().numpy())
+
+    z_all = np.concatenate(all_latents, axis=0)  # (N_mol, latent_dim)
+    return z_all
+
+
+# ============================================================
+# 메인
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Train EquivGNN encoder on QM9")
+    parser.add_argument("--epochs", type=int, default=configs.ENC_EPOCHS)
+    parser.add_argument("--batch_size", type=int, default=configs.ENC_BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=configs.ENC_LR)
+    parser.add_argument("--weight_decay", type=float, default=configs.ENC_WEIGHT_DECAY)
+    parser.add_argument("--seed", type=int, default=configs.SEED)
+    parser.add_argument("--latent_dim", type=int, default=configs.LATENT_DIM)
+    args = parser.parse_args()
+
+    # ----------------------------------------------
+    # Seed & Device & Logger
+    # ----------------------------------------------
+    utils.set_seed(args.seed)
+    device = utils.get_device()
+
+    log_file = os.path.join(configs.RESULT_DIR, "train_encoder_qm9.log")
+    logger = utils.get_logger("train_encoder_qm9", log_file=log_file)
+
+    logger.info("===== Train EquivGNN Encoder on QM9 (self-supervised) =====")
+    logger.info(f"Device: {device}")
+    logger.info(f"Epochs: {args.epochs}, BatchSize: {args.batch_size}, LR: {args.lr}")
+    logger.info(f"Latent dim: {args.latent_dim}")
+
+    # ----------------------------------------------
+    # QM9 Dataset 로드
+    # ----------------------------------------------
+    qm9_root = os.path.join(configs.DATA_ROOT, "qm9")
+    logger.info(f"Loading QM9 dataset from: {qm9_root}")
+    dataset = QM9(root=qm9_root)
+
+    N_data = len(dataset)
+    logger.info(f"QM9 total molecules: {N_data}")
+
+    # ----------------------------------------------
+    # 구조 descriptor 사전 계산 + Data에 저장
+    # ----------------------------------------------
+    logger.info("Precomputing structural descriptors for all molecules...")
+
+    for data in tqdm(dataset, desc="Build descriptors", ncols=100):
+        # pos: (N_i, 3)
+        desc = build_structural_descriptor(
+            data.pos,
+            num_bins=configs.DESC_NUM_BINS,
+            r_max=configs.DESC_R_MAX,
+            device=torch.device("cpu"),
+        )
+        # Data 객체에 바로 저장 (PyG가 graph-wise 속성으로 잘 collate 해줌)
+        data.struct_desc = desc
+
+    logger.info("Finished structural descriptor precomputation.")
+
+    # ----------------------------------------------
+    # Train / Val / Test split
+    # ----------------------------------------------
+    idx_train, idx_val, idx_test = utils.train_val_test_split_indices(
+        N_data,
+        configs.TRAIN_VAL_TEST_SPLIT,
+        seed=args.seed
+    )
+    logger.info(
+        f"Split sizes - train: {len(idx_train)}, "
+        f"val: {len(idx_val)}, test: {len(idx_test)}"
+    )
+
+    train_subset = Subset(dataset, idx_train)
+    val_subset = Subset(dataset, idx_val)
+    full_loader = PyGDataLoader(
+        dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=configs.NUM_WORKERS, pin_memory=configs.PIN_MEMORY
+    )
+
+    train_loader = PyGDataLoader(
+        train_subset, batch_size=args.batch_size, shuffle=True,
+        num_workers=configs.NUM_WORKERS, pin_memory=configs.PIN_MEMORY
+    )
+
+    val_loader = None
+    if len(idx_val) > 0:
+        val_loader = PyGDataLoader(
+            val_subset, batch_size=args.batch_size, shuffle=False,
+            num_workers=configs.NUM_WORKERS, pin_memory=configs.PIN_MEMORY
+        )
+
+    # ----------------------------------------------
+    # 모델/옵티마 초기화
+    # ----------------------------------------------
+    encoder = EquivGNNEncoder(latent_dim=args.latent_dim).to(device)
+    decoder = EquivDecoder(latent_dim=args.latent_dim, desc_dim=configs.DESC_DIM).to(device)
+
+    params = list(encoder.parameters()) + list(decoder.parameters())
+    optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
+    criterion = nn.MSELoss()
+
+    best_val_loss = float("inf")
+    best_epoch = -1
+
+    encoder_ckpt_path = os.path.join(configs.MODEL_DIR, "encoder_struct.pt")
+    decoder_ckpt_path = os.path.join(configs.MODEL_DIR, "decoder_struct.pt")
+    os.makedirs(configs.MODEL_DIR, exist_ok=True)
+
+    # ----------------------------------------------
+    # 학습 루프
+    # ----------------------------------------------
+    for epoch in range(1, args.epochs + 1):
+        logger.info(f"=== Epoch {epoch}/{args.epochs} ===")
+
+        train_loss = train_one_epoch(
+            encoder, decoder, train_loader,
+            optimizer, device, criterion
+        )
+        logger.info(f"Train loss: {train_loss:.6f}")
+
+        if val_loader is not None:
+            val_loss = eval_one_epoch(
+                encoder, decoder, val_loader, device, criterion
+            )
+            logger.info(f"Val loss:   {val_loss:.6f}")
+        else:
+            val_loss = train_loss
+
+        # Best 모델 저장
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+
+            torch.save(encoder.state_dict(), encoder_ckpt_path)
+            torch.save(decoder.state_dict(), decoder_ckpt_path)
+            logger.info(
+                f"  >> New best model saved (epoch {epoch}, val_loss={val_loss:.6f})"
+            )
+
+    logger.info(
+        f"Training finished. Best epoch: {best_epoch}, best val_loss: {best_val_loss:.6f}"
+    )
+
+    # ----------------------------------------------
+    # Best encoder 로드 후 전체 latent 추출
+    # ----------------------------------------------
+    logger.info("Loading best encoder checkpoint and extracting latents...")
+    encoder.load_state_dict(torch.load(encoder_ckpt_path, map_location=device))
+
+    z_all = extract_latents(encoder, full_loader, device)  # (N, latent_dim)
+
+    # ----------------------------------------------
+    # QM9 HOMO 값 y_all 추출
+    # ----------------------------------------------
+    logger.info("Extracting HOMO values from QM9 dataset...")
+    target_idx = configs.QM9_HOMO_TARGET_INDEX
+
+    y_all_list = []
+    for data in dataset:
+        # PyG QM9: data.y shape (1, 19) or (19,)
+        y = data.y.view(-1)
+        y_homo = y[target_idx].item()
+        y_all_list.append(y_homo)
+
+    y_all = np.array(y_all_list, dtype=np.float32)
+
+    assert z_all.shape[0] == y_all.shape[0] == N_data, \
+        "z_all / y_all length mismatch"
+
+    # ----------------------------------------------
+    # latent + target + split index 저장
+    # ----------------------------------------------
+    npz_path = configs.LATENT_NPZ_PATH
+    os.makedirs(os.path.dirname(npz_path), exist_ok=True)
+
+    logger.info(f"Saving latents and splits to: {npz_path}")
+    np.savez_compressed(
+        npz_path,
+        z_all=z_all,
+        y_all=y_all,
+        idx_train=idx_train,
+        idx_val=idx_val,
+        idx_test=idx_test,
+    )
+    logger.info("All done. ✅")
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+utils.py
+- seed 고정
+- metric 계산 (numpy / torch)
+- logging 세팅 (RotatingFileHandler 포함)
+- device 헬퍼
+- train/val/test split
+- 학습 곡선 플롯 (샘플 수 vs MAE)
+"""
+
+import os
+import random
+import logging
+from logging.handlers import RotatingFileHandler
+from typing import Tuple, Dict, List
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+import configs  # LOG_LEVEL, SEED 등 사용
+
+
+# ==============================
+# Seed 고정
+# ==============================
+def set_seed(seed: int) -> None:
+    """random / numpy / torch / cuda 모두 seed 고정."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        # 완전 재현성을 원하면 deterministic 설정
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+# ==============================
+# Device 헬퍼
+# ==============================
+def get_device() -> torch.device:
+    """cuda 사용 가능하면 cuda, 아니면 cpu."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ==============================
+# Metric 계산 (numpy 버전)
+# ==============================
+def mae_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def rmse_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def r2_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    if ss_tot == 0:
+        return 0.0
+    return float(1 - ss_res / ss_tot)
+
+
+# ---- alias (다른 스크립트에서 mae, rmse, r2_numpy 이름으로도 사용 가능하게) ----
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for mae_np (편의용)."""
+    return mae_np(y_true, y_pred)
+
+
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for rmse_np (편의용)."""
+    return rmse_np(y_true, y_pred)
+
+
+def r2_numpy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Alias for r2_np (이름 취향용)."""
+    return r2_np(y_true, y_pred)
+
+
+# ==============================
+# Metric 계산 (torch 버전)
+# ==============================
+def mae_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    return float(torch.mean(torch.abs(y_true - y_pred)).item())
+
+
+def rmse_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    return float(torch.sqrt(torch.mean((y_true - y_pred) ** 2)).item())
+
+
+def r2_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    y_true = y_true.detach()
+    y_pred = y_pred.detach()
+    ss_res = torch.sum((y_true - y_pred) ** 2)
+    ss_tot = torch.sum((y_true - torch.mean(y_true)) ** 2)
+    if ss_tot.item() == 0:
+        return 0.0
+    return float(1 - ss_res / ss_tot)
+
+
+# ==============================
+# Logging 세팅
+# ==============================
+def get_logger(
+    name: str,
+    log_file: str = None,
+    level: str = None
+) -> logging.Logger:
+    """
+    RotatingFileHandler + 콘솔 핸들러를 사용하는 logger 생성.
+    - name: logger 이름
+    - log_file: 파일로도 남기고 싶으면 경로 지정 (None이면 파일 로깅 없음)
+    - level: "DEBUG" / "INFO" 등 (None이면 configs.LOG_LEVEL 사용)
+    """
+    logger = logging.getLogger(name)
+
+    # 이미 핸들러가 있으면 중복 추가 방지
+    if logger.handlers:
+        return logger
+
+    if level is None:
+        level = getattr(configs, "LOG_LEVEL", "INFO")
+
+    logger.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # 콘솔 핸들러
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    # 파일 핸들러 (선택)
+    if log_file is not None:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        fh = RotatingFileHandler(
+            log_file,
+            maxBytes=10_000_000,
+            backupCount=5
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    return logger
+
+
+# ==============================
+# Train/Val/Test Split
+# ==============================
+def train_val_test_split_indices(
+    N: int,
+    ratios: Tuple[float, float, float],
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    전체 N개 인덱스를 ratios 비율로 나눈 train/val/test 인덱스 반환.
+    """
+    assert len(ratios) == 3, "ratios must be (train, val, test)"
+    train_r, val_r, test_r = ratios
+    assert abs(train_r + val_r + test_r - 1.0) < 1e-6, "ratios must sum to 1"
+
+    rng = np.random.RandomState(seed)
+    indices = np.arange(N)
+    rng.shuffle(indices)
+
+    n_train = int(N * train_r)
+    n_val = int(N * val_r)
+
+    idx_train = indices[:n_train]
+    idx_val = indices[n_train:n_train + n_val]
+    idx_test = indices[n_train + n_val:]
+
+    return idx_train, idx_val, idx_test
+
+
+# ==============================
+# 학습 곡선 플롯 (샘플 수 vs MAE)
+# ==============================
+def save_learning_curve(
+    x_values: List[int],
+    y_dict: Dict[str, List[float]],
+    out_png: str,
+    xlabel: str = "# train samples",
+    ylabel: str = "MAE",
+    title: str = "Sampling comparison"
+) -> None:
+    """
+    x_values: N 리스트 (예: [10, 20, 50, ...])
+    y_dict: {"random": [..], "latent": [..]} 형식
+    """
+    plt.figure(figsize=(8, 5))
+    for label, ys in y_dict.items():
+        plt.plot(x_values, ys, marker="o", label=label)
+
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(alpha=0.3)
+    plt.legend()
+
+    out_dir = os.path.dirname(out_png)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.close()
